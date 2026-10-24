@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>STT Latency Bench</title>
+<style>
+  :root { --bg:#fafaf9; --card:#fff; --ink:#1c1c1a; --muted:#6b6b66; --line:#e4e4df; --ws:#2f6fdb; --ca:#c2410c; --good:#15803d; --bad:#b91c1c; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#161615; --card:#1f1f1d; --ink:#ededea; --muted:#9a9a94; --line:#33332f; --ws:#6ea0ff; --ca:#fb923c; --good:#4ade80; --bad:#f87171; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.45 system-ui, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 20px 16px 60px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 16px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  label { font-size: 13px; color: var(--muted); }
+  input, select { font: inherit; padding: 6px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
+  input[type=text] { min-width: 260px; flex: 1; }
+  button { font: inherit; padding: 8px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--ink); cursor: pointer; }
+  button.primary { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+  button:disabled { opacity: .45; cursor: default; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
+  .pane h2 { font-size: 14px; margin: 0 0 8px; display: flex; justify-content: space-between; }
+  .ws h2 { color: var(--ws); } .ca h2 { color: var(--ca); }
+  .words { min-height: 120px; max-height: 220px; overflow: auto; font-size: 16px; }
+  .words span { display: inline-block; margin: 0 4px 2px 0; padding: 0 2px; border-radius: 3px; transition: background 1s; }
+  .words span.new { background: color-mix(in srgb, currentColor 18%, transparent); }
+  .meter { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; flex: 1; min-width: 120px; }
+  .meter div { height: 100%; width: 0; background: var(--good); transition: width .05s; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line); display: inline-block; }
+  .dot.on { background: var(--good); }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  th:first-child, td:first-child { text-align: left; }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; }
+  .verdict { font-size: 17px; margin: 0 0 10px; }
+  .passage { color: var(--muted); font-size: 15px; }
+  .log { font: 12px/1.4 ui-monospace, monospace; color: var(--muted); max-height: 140px; overflow: auto; white-space: pre-wrap; }
+  .err { color: var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <h1>STT latency: Web Speech vs Cartesia Ink-2</h1>
+  <p class="sub">Same mic, both engines at once. Read the passage at talk pace for about a minute, with a few pauses, then press Stop.</p>
+
+  <div class="card">
+    <div class="row">
+      <label>Chunk size
+        <select id="chunk"><option value="20">20 ms</option><option value="50" selected>50 ms</option><option value="100">100 ms (Cartesia's suggestion)</option></select>
+      </label>
+      <label>Eager-end threshold
+        <select id="eager"><option value="">default (0.6)</option><option value="0.75">0.75 (faster)</option></select>
+      </label>
+      <input type="text" id="keyterms" value="abandoned house, storm, footsteps, ghost" aria-label="Keyterms" title="Sent to Cartesia as keyterm boost (your session keywords)" />
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button class="primary" id="start">Start</button>
+      <button id="stop" disabled>Stop</button>
+      <button id="copy" disabled>Copy results</button>
+      <span class="dot" id="speaking" title="Local voice activity"></span>
+      <div class="meter"><div id="level"></div></div>
+    </div>
+  </div>
+
+  <div class="card passage">
+    The storm had been building since noon, and by the time we reached the abandoned house the rain was coming sideways.
+    The front door was open. Not broken, just open, as if someone had stepped out for a minute and meant to come back.
+    We stood in the hallway listening. Footsteps upstairs. Slow ones. Then nothing.
+    My brother laughed and said it was the wind. And then the door behind us closed, very gently, by itself.
+    <br><br>Pause for two seconds between paragraphs. Then try a few quick asides: "just kidding", "anyway", "so yeah".
+  </div>
+
+  <div class="grid">
+    <div class="card pane ws"><h2><span>Web Speech (interim results)</span><span id="wsCount">0 words</span></h2><div class="words" id="wsWords"></div></div>
+    <div class="card pane ca"><h2><span>Cartesia Ink-2 (turns)</span><span id="caCount">0 words</span></h2><div class="words" id="caWords"></div></div>
+  </div>
+
+  <div class="card" id="results" hidden>
+    <p class="verdict" id="verdict"></p>
+    <table>
+      <thead><tr><th>Metric</th><th>Web Speech median</th><th>p90</th><th>Cartesia median</th><th>p90</th><th>n</th></tr></thead>
+      <tbody id="table"></tbody>
+    </table>
+    <p class="sub" style="margin-top:10px" id="notes"></p>
+  </div>
+
+  <div class="card"><div class="log" id="log"></div></div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const now = () => performance.now();
+
+let S = null;          // run state
+let audio = null;      // { ctx, stream, node }
+let rec = null;        // SpeechRecognition
+let sock = null;       // Cartesia WebSocket
+
+function freshState() {
+  return {
+    t0: now(), running: true,
+    ws: [], wsLive: [], wsFinalIdx: new Set(), wsFinals: [], wsRevisions: 0, wsRestarts: 0,
+    ca: [], caTurnCount: 0, caEnds: [], caEager: [], caConnectedAt: null, caError: null,
+    onsets: [], offsets: [],
+    vad: { floor: 0, frames: 0, speaking: false, above: 0, below: 0 },
+    pending: [],
+  };
+}
+
+const log = (msg, err) => {
+  const line = `[${((now() - (S?.t0 ?? now())) / 1000).toFixed(2)}s] ${msg}\n`;
+  const el = $("log");
+  el.insertAdjacentHTML("beforeend", err ? `<span class="err">${escapeHtml(line)}</span>` : escapeHtml(line));
+  el.scrollTop = el.scrollHeight;
+};
+const escapeHtml = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]);
+const tokenize = (s) => s.toLowerCase().replace(/[^a-z0-9'\s]/g, " ").split(/\s+/).filter(Boolean);
+
+// ---------------------------------------------------------------- audio + VAD
+
+const WORKLET = `
+class Cap extends AudioWorkletProcessor {
+  constructor(o) {
+    super();
+    this.ratio = sampleRate / 16000; this.pos = 0; this.acc = 0; this.cnt = 0;
+    this.chunk = o.processorOptions.chunk; this.buf = new Int16Array(this.chunk); this.n = 0;
+    this.rmsN = Math.round(sampleRate * 0.01); this.sum = 0; this.k = 0;
+  }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (!ch) return true;
+    for (let i = 0; i < ch.length; i++) {
+      const x = ch[i];
+      this.sum += x * x;
+      if (++this.k >= this.rmsN) { this.port.postMessage({ rms: Math.sqrt(this.sum / this.k) }); this.sum = 0; this.k = 0; }
+      this.acc += x; this.cnt++; this.pos += 1;
+      if (this.pos >= this.ratio) {           // boxcar-average down to 16 kHz
+        this.pos -= this.ratio;
+        const v = Math.max(-1, Math.min(1, this.acc / this.cnt));
+        this.acc = 0; this.cnt = 0;
+        this.buf[this.n++] = v < 0 ? v * 32768 : v * 32767;
+        if (this.n === this.chunk) { this.port.postMessage({ pcm: this.buf.buffer }, [this.buf.buffer]); this.buf = new Int16Array(this.chunk); this.n = 0; }
+      }
+    }
+    return true;
+  }
+}
+registerProcessor("cap", Cap);`;
+
+async function startAudio(chunkMs) {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
+  const ctx = new AudioContext();
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: "text/javascript" })));
+  const src = ctx.createMediaStreamSource(stream);
+  const node = new AudioWorkletNode(ctx, "cap", { processorOptions: { chunk: Math.round(16 * chunkMs) } });
+  const mute = ctx.createGain(); mute.gain.value = 0;
+  src.connect(node).connect(mute).connect(ctx.destination);
+  node.port.onmessage = ({ data }) => {
+    if (!S?.running) return;
+    if (data.rms !== undefined) onRms(now(), data.rms);
+    if (data.pcm) sendPcm(data.pcm);
+  };
+  log(`mic at ${ctx.sampleRate} Hz → 16 kHz PCM, ${chunkMs} ms chunks`);
+  return { ctx, stream, node };
+}
+
+function onRms(t, r) {
+  const v = S.vad;
+  $("level").style.width = `${Math.min(100, r * 400)}%`;
+  if (v.frames < 30) { v.floor = Math.max(v.floor, r); v.frames++; return; }   // first 300 ms: noise floor
+  if (!v.speaking) v.floor = 0.98 * v.floor + 0.02 * Math.min(r, v.floor * 2);
+  const thr = Math.max(0.01, v.floor * 3);
+  if (r > thr) {
+    v.above++; v.below = 0;
+    if (!v.speaking && v.above >= 3) { v.speaking = true; S.onsets.push(t - 30); $("speaking").classList.add("on"); }
+  } else {
+    v.below++; v.above = 0;
+    if (v.speaking && v.below >= 40) { v.speaking = false; S.offsets.push(t - 400); $("speaking").classList.remove("on"); }
+  }
+}
+
+// ---------------------------------------------------------------- Web Speech
+
+function startWebSpeech() {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { log("Web Speech API not available — use desktop Chrome", true); return; }
+  rec = new SR();
+  rec.continuous = true; rec.interimResults = true; rec.lang = "en-US";
+  rec.onresult = (e) => {
+    const t = now();
+    let text = "";
+    for (let i = 0; i < e.results.length; i++) {
+      text += " " + e.results[i][0].transcript;
+      if (e.results[i].isFinal && !S.wsFinalIdx.has(i)) { S.wsFinalIdx.add(i); S.wsFinals.push(t); }
+    }
+    const toks = tokenize(text);
+    for (let i = 0; i < toks.length; i++) {
+      const prev = S.wsLive[i];
+      if (!prev) S.wsLive[i] = { text: toks[i], t };
+      else if (prev.text !== toks[i]) { S.wsRevisions++; S.wsLive[i] = { text: toks[i], t }; }  // word changed: its correct version arrives now
+    }
+    if (toks.length < S.wsLive.length) { S.wsRevisions += S.wsLive.length - toks.length; S.wsLive.length = toks.length; }
+    render("ws");
+  };
+  rec.onerror = (e) => { if (e.error !== "no-speech" && e.error !== "aborted") log(`Web Speech error: ${e.error}`, true); };
+  rec.onend = () => {                       // Chrome ends sessions on its own; commit and restart
+    S.ws.push(...S.wsLive); S.wsLive = []; S.wsFinalIdx = new Set();
+    if (S.running) { S.wsRestarts++; try { rec.start(); } catch {} }
+  };
+  rec.start();
+  log("Web Speech started");
+}
+
+// ---------------------------------------------------------------- Cartesia
+
+async function startCartesia() {
+  const r = await fetch("/token", { method: "POST" });
+  const body = await r.json();
+  if (!r.ok) { S.caError = body.error; log(`Cartesia token: ${body.error}`, true); return; }
+  const url = new URL("wss://api.cartesia.ai/stt/turns/websocket");
+  url.searchParams.set("model", "ink-2");
+  url.searchParams.set("encoding", "pcm_s16le");
+  url.searchParams.set("sample_rate", "16000");
+  url.searchParams.set("cartesia_version", body.version);
+  url.searchParams.set("access_token", body.token);
+  if ($("eager").value) url.searchParams.set("turn_eager_end_threshold", $("eager").value);
+  for (const k of $("keyterms").value.split(",").map((s) => s.trim()).filter(Boolean)) url.searchParams.append("keyterm", k);
+
+  const opened = now();
+  sock = new WebSocket(url);
+  sock.binaryType = "arraybuffer";
+  sock.onopen = () => {
+    log(`Cartesia socket open in ${Math.round(now() - opened)} ms`);
+    for (const buf of S.pending) sock.send(buf);
+    S.pending = [];
+  };
+  sock.onmessage = ({ data }) => {
+    if (typeof data !== "string") return;
+    const t = now();
+    const m = JSON.parse(data);
+    switch (m.type) {
+      case "connected": S.caConnectedAt = t; break;
+      case "turn.start": S.caTurnCount = 0; break;
+      case "turn.update": case "turn.eager_end": case "turn.end": {
+        const toks = tokenize(m.transcript || "");
+        for (let i = S.caTurnCount; i < toks.length; i++) S.ca.push({ text: toks[i], t });
+        S.caTurnCount = Math.max(S.caTurnCount, toks.length);
+        if (m.type === "turn.eager_end") S.caEager.push(t);
+        if (m.type === "turn.end") S.caEnds.push(t);
+        render("ca");
+        break;
+      }
+      case "error": S.caError = m.message; log(`Cartesia error ${m.status_code}: ${m.title} — ${m.message}`, true); break;
+    }
+  };
+  sock.onclose = (e) => log(`Cartesia socket closed (${e.code}${e.reason ? " " + e.reason : ""})`, e.code !== 1000 && e.code !== 1005);
+  sock.onerror = () => log("Cartesia socket error (check the key, version and network)", true);
+}
+
+function sendPcm(buf) {
+  if (sock?.readyState === WebSocket.OPEN) sock.send(buf);
+  else if (!sock || sock.readyState === WebSocket.CONNECTING) S.pending.push(buf);
+}
+
+// ---------------------------------------------------------------- UI
+
+function render(which) {
+  const list = which === "ws" ? [...S.ws, ...S.wsLive] : S.ca;
+  const el = $(which + "Words");
+  const recent = list.slice(-60);
+  el.innerHTML = recent.map((w) => `<span class="${now() - w.t < 600 ? "new" : ""}">${escapeHtml(w.text)}</span>`).join("");
+  el.scrollTop = el.scrollHeight;
+  $(which + "Count").textContent = `${list.length} words`;
+}
+
+$("start").onclick = async () => {
+  $("start").disabled = true; $("results").hidden = true; $("log").textContent = "";
+  $("wsWords").innerHTML = ""; $("caWords").innerHTML = "";
+  S = freshState();
+  try {
+    audio = await startAudio(Number($("chunk").value));
+    startWebSpeech();
+    await startCartesia();
+    $("stop").disabled = false;
+  } catch (err) {
+    log(String(err), true);
+    $("start").disabled = false;
+  }
+};
+
+$("stop").onclick = async () => {
+  $("stop").disabled = true;
+  S.running = false;
+  try { rec?.stop(); } catch {}
+  if (sock?.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ type: "close" }));
+  await new Promise((r) => setTimeout(r, 1500));       // let both engines flush their last words
+  S.ws.push(...S.wsLive); S.wsLive = [];
+  try { sock?.close(); } catch {}
+  audio?.stream.getTracks().forEach((t) => t.stop());
+  await audio?.ctx.close();
+  showResults(compute());
+  $("start").disabled = false; $("copy").disabled = false;
+};
+
+$("copy").onclick = async () => {
+  const r = compute();
+  const rel = (xs) => xs.map((x) => Math.round(x - S.t0));
+  const payload = {
+    ...r.summary,
+    settings: { chunkMs: Number($("chunk").value), eager: $("eager").value || "default", keyterms: $("keyterms").value, ua: navigator.userAgent },
+    raw: {
+      webSpeech: S.ws.map((w) => [w.text, Math.round(w.t - S.t0)]),
+      cartesia: S.ca.map((w) => [w.text, Math.round(w.t - S.t0)]),
+      onsets: rel(S.onsets), offsets: rel(S.offsets),
+      wsFinals: rel(S.wsFinals), caEnds: rel(S.caEnds), caEager: rel(S.caEager),
+    },
+  };
+  await navigator.clipboard.writeText(JSON.stringify(payload, null, 1));
+  $("copy").textContent = "Copied";
+  setTimeout(() => ($("copy").textContent = "Copy results"), 1500);
+};
+
+// ---------------------------------------------------------------- metrics
+
+function compute() {
+  const ws = S.ws, ca = S.ca;
+  const pairs = align(ws.map((w) => w.text), ca.map((w) => w.text));
+  const head = pairs.map(([i, j]) => ca[j].t - ws[i].t);
+
+  // Time from local speech onset to the first word each engine shows for that utterance
+  const first = (words, o, next) => { const w = words.find((w) => w.t > o && w.t < Math.min(next, o + 4000)); return w ? w.t - o : null; };
+  const wsFirst = [], caFirst = [];
+  S.onsets.forEach((o, k) => {
+    const next = S.onsets[k + 1] ?? Infinity;
+    const a = first(ws, o, next), b = first(ca, o, next);
+    if (a !== null) wsFirst.push(a);
+    if (b !== null) caFirst.push(b);
+  });
+
+  // Time from end of speech to the engine committing the utterance
+  const after = (ts, f, max) => { const t = ts.find((t) => t > f && t < f + max); return t !== undefined ? t - f : null; };
+  const wsEnd = [], caEnd = [], caEag = [];
+  for (const f of S.offsets) {
+    const a = after(S.wsFinals, f, 4000), b = after(S.caEnds, f, 7000), c = after(S.caEager, f, 4000);
+    if (a !== null) wsEnd.push(a);
+    if (b !== null) caEnd.push(b);
+    if (c !== null) caEag.push(c);
+  }
+
+  const summary = {
+    words: { webSpeech: ws.length, cartesia: ca.length, matched: pairs.length },
+    headToHeadMs: stats(head),                 // + = Cartesia later than Web Speech on the same word
+    cartesiaFirstPct: head.length ? Math.round((100 * head.filter((d) => d < 0).length) / head.length) : null,
+    firstWordAfterOnsetMs: { webSpeech: stats(wsFirst), cartesia: stats(caFirst) },
+    endOfSpeechToFinalMs: { webSpeech: stats(wsEnd), cartesia: stats(caEnd), cartesiaEager: stats(caEag) },
+    webSpeechRevisions: S.wsRevisions,
+    webSpeechRestarts: S.wsRestarts,
+    utterances: S.onsets.length,
+    cartesiaError: S.caError,
+  };
+  return { summary };
+}
+
+function stats(xs) {
+  if (!xs.length) return { median: null, p90: null, n: 0 };
+  const s = [...xs].sort((a, b) => a - b);
+  const q = (p) => s[Math.min(s.length - 1, Math.floor(p * (s.length - 1) + 0.5))];
+  return { median: Math.round(q(0.5)), p90: Math.round(q(0.9)), n: s.length };
+}
+
+/** Longest common subsequence of two word lists → matched index pairs. */
+function align(a, b) {
+  const n = a.length, m = b.length, W = m + 1;
+  const dp = new Uint16Array((n + 1) * W);
+  for (let i = n - 1; i >= 0; i--)
+    for (let j = m - 1; j >= 0; j--)
+      dp[i * W + j] = a[i] === b[j] ? dp[(i + 1) * W + j + 1] + 1 : Math.max(dp[(i + 1) * W + j], dp[i * W + j + 1]);
+  const out = [];
+  for (let i = 0, j = 0; i < n && j < m; ) {
+    if (a[i] === b[j]) { out.push([i, j]); i++; j++; }
+    else if (dp[(i + 1) * W + j] >= dp[i * W + j + 1]) i++;
+    else j++;
+  }
+  return out;
+}
+
+function showResults({ summary: s }) {
+  const fmt = (x) => (x === null ? "—" : `${x} ms`);
+  const row = (name, a, b) =>
+    `<tr><td>${name}</td><td>${fmt(a?.median ?? null)}</td><td>${fmt(a?.p90 ?? null)}</td><td>${fmt(b?.median ?? null)}</td><td>${fmt(b?.p90 ?? null)}</td><td>${Math.max(a?.n ?? 0, b?.n ?? 0)}</td></tr>`;
+  $("table").innerHTML =
+    row("First word after speech starts", s.firstWordAfterOnsetMs.webSpeech, s.firstWordAfterOnsetMs.cartesia) +
+    row("End of speech → final", s.endOfSpeechToFinalMs.webSpeech, s.endOfSpeechToFinalMs.cartesia) +
+    row("End of speech → eager end (Cartesia)", null, s.endOfSpeechToFinalMs.cartesiaEager) +
+    `<tr><td>Same word, Cartesia minus Web Speech</td><td colspan="2"></td><td>${fmt(s.headToHeadMs.median)}</td><td>${fmt(s.headToHeadMs.p90)}</td><td>${s.headToHeadMs.n}</td></tr>`;
+
+  const d = s.headToHeadMs.median;
+  let verdict;
+  if (s.cartesiaError) verdict = `Cartesia didn't run: ${s.cartesiaError}`;
+  else if (d === null) verdict = "Not enough matched words to compare — read longer, closer to the mic.";
+  else if (d > 0) verdict = `Cartesia shows each word about ${d} ms later than Web Speech (median; ${s.headToHeadMs.p90} ms at p90). Cartesia was first on ${s.cartesiaFirstPct}% of words.`;
+  else verdict = `Cartesia shows each word about ${-d} ms earlier than Web Speech (median). Cartesia was first on ${s.cartesiaFirstPct}% of words.`;
+  $("verdict").textContent = verdict;
+
+  const budget = d === null ? "" : d > 0
+    ? ` Against the spec's 250–350 ms word-to-sound budget, switching would put the typical cue at roughly ${250 + d}–${350 + d} ms.`
+    : " That fits inside the spec's 250–350 ms word-to-sound budget with room to spare.";
+  $("notes").textContent =
+    `Words: Web Speech ${s.words.webSpeech}, Cartesia ${s.words.cartesia}, matched ${s.words.matched}. ` +
+    `Web Speech revised or retracted ${s.webSpeechRevisions} interim words (each one is a chance for the scorer to fire on a wrong word); Cartesia never revises.` +
+    budget + " Run it 2–3 times and with each chunk size; the first run includes connection warm-up.";
+  $("results").hidden = false;
+}
+</script>
+</body>
+</html>
