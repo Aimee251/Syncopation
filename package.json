@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "app": "tsx --env-file=.env server.ts",
+    "share": "tsx --env-file=.env server.ts --share",
     "dev": "tsx --env-file=.env cli.ts",
     "start": "tsx --env-file=.env cli.ts",
     "mic": "tsx --env-file=.env predict.ts",
