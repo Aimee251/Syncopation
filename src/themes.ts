@@ -18,6 +18,13 @@ export const THEMES: ThemePreset[] = [
     keywordHint: "abandoned house, storm, footsteps, ghost",
   },
   {
+    id: "thriller",
+    label: "Thriller",
+    moods: ["calm", "suspense", "chase", "climax"],
+    sfx: ["heartbeat", "footsteps", "door_slam", "glass_break"],
+    keywordHint: "chase, heartbeat, footsteps, gunshot, alarm",
+  },
+  {
     id: "pitch_presentation",
     label: "Pitch presentation",
     moods: ["focused", "building", "uplifting", "triumphant"],

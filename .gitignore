@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.local
+.DS_Store
+dist/
+public/sounds/*.mp3
+public/sounds/*.wav
+public/sounds/*.ogg
+library.prepared.json
+sessions/

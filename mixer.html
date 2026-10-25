@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Syncopation · Output mixer</title>
+  <meta name="description"
+    content="Local output mixer for Syncopation: crossfaded music beds, ducking and sound effects driven by the prediction engine.">
+  <style>
+    :root {
+      --bg: #0b0a14;
+      --card: rgba(255, 255, 255, .05);
+      --line: rgba(255, 255, 255, .09);
+      --txt: #ecebff;
+      --dim: #8b88b0;
+      --a: #8b5cf6;
+      --b: #22d3ee;
+      --hot: #fb7185;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font: 15px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+      color: var(--txt);
+      background: radial-gradient(1200px 700px at 15% -10%, #2a1b5e 0%, transparent 60%), radial-gradient(900px 600px at 100% 10%, #0c3a4a 0%, transparent 55%), var(--bg);
+    }
+
+    main {
+      max-width: 880px;
+      margin: 0 auto;
+      padding: 40px 22px 60px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 26px;
+      letter-spacing: -.02em;
+      font-weight: 700;
+    }
+
+    h1 span {
+      background: linear-gradient(90deg, var(--a), var(--b));
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      border-radius: 999px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      color: var(--dim);
+      font-size: 13px;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: #555;
+    }
+
+    .pill.live {
+      color: var(--txt);
+    }
+
+    .pill.live .dot {
+      background: #34d399;
+      box-shadow: 0 0 12px #34d399;
+      animation: pulse 1.6s infinite;
+    }
+
+    .pill.wait .dot {
+      background: #fbbf24;
+    }
+
+    @keyframes pulse {
+      50% {
+        opacity: .4;
+      }
+    }
+
+    #start {
+      margin: 34px 0 8px;
+      width: 100%;
+      padding: 20px;
+      border: 0;
+      border-radius: 18px;
+      font-weight: 600;
+      font-size: 17px;
+      font-family: inherit;
+      color: #fff;
+      cursor: pointer;
+      background: linear-gradient(90deg, var(--a), #6366f1 50%, var(--b));
+      box-shadow: 0 18px 50px -18px var(--a);
+      transition: transform .15s, box-shadow .15s;
+    }
+
+    #start:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 24px 60px -16px var(--a);
+    }
+
+    #start[hidden] {
+      display: none;
+    }
+
+    .hint {
+      color: var(--dim);
+      font-size: 13px;
+      margin: 6px 2px 0;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-top: 26px;
+    }
+
+    @media (max-width:640px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 18px 20px;
+      backdrop-filter: blur(8px);
+    }
+
+    .card h2 {
+      margin: 0 0 4px;
+      font-size: 12px;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+      color: var(--dim);
+      font-weight: 600;
+    }
+
+    .track {
+      font-size: 19px;
+      font-weight: 600;
+      min-height: 28px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .bar {
+      height: 8px;
+      margin-top: 12px;
+      border-radius: 99px;
+      background: rgba(255, 255, 255, .08);
+      overflow: hidden;
+    }
+
+    .bar i {
+      display: block;
+      height: 100%;
+      width: 0;
+      border-radius: 99px;
+      background: linear-gradient(90deg, var(--a), var(--b));
+      transition: width .8s ease;
+    }
+
+    .meta {
+      display: flex;
+      justify-content: space-between;
+      margin-top: 8px;
+      color: var(--dim);
+      font-size: 12px;
+    }
+
+    canvas {
+      width: 100%;
+      height: 90px;
+      display: block;
+      margin-top: 26px;
+      border-radius: 18px;
+      background: var(--card);
+      border: 1px solid var(--line);
+    }
+
+    .duck {
+      color: var(--b);
+      opacity: 0;
+      transition: opacity .25s;
+    }
+
+    .duck.on {
+      opacity: 1;
+    }
+
+    ul {
+      list-style: none;
+      margin: 10px 0 0;
+      padding: 0;
+      max-height: 260px;
+      overflow: auto;
+    }
+
+    li {
+      display: flex;
+      justify-content: space-between;
+      padding: 9px 2px;
+      border-bottom: 1px solid var(--line);
+      animation: in .4s ease;
+    }
+
+    li b {
+      font-weight: 600;
+    }
+
+    li span {
+      color: var(--dim);
+      font-size: 12px;
+    }
+
+    li.sfx b::before {
+      content: "♪ ";
+      color: var(--hot);
+    }
+
+    @keyframes in {
+      from {
+        opacity: 0;
+        transform: translateY(-6px);
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <main>
+    <header>
+      <h1>Syncopation <span>output</span></h1>
+      <div id="status" class="pill wait"><i class="dot"></i><span id="statusText">Click Start to enable audio</span>
+      </div>
+    </header>
+
+    <button id="start">▶ Start — enable audio on this computer</button>
+    <p class="hint" id="hint">Browsers only allow sound after a click. Use headphones: the microphone would otherwise
+      hear the soundtrack.</p>
+
+    <div class="grid">
+      <section class="card">
+        <h2>Music bed</h2>
+        <div class="track" id="musicName">—</div>
+        <div class="bar"><i id="musicBar"></i></div>
+        <div class="meta"><span id="musicLvl">level 0.00</span><span class="duck" id="duckTag">ducking</span></div>
+      </section>
+      <section class="card">
+        <h2>Ambience bed</h2>
+        <div class="track" id="ambName">—</div>
+        <div class="bar"><i id="ambBar"></i></div>
+        <div class="meta"><span id="ambLvl">level 0.00</span><span></span></div>
+      </section>
+    </div>
+
+    <canvas id="scope" width="1600" height="180"></canvas>
+
+    <section class="card" style="margin-top:16px">
+      <h2>Cues</h2>
+      <ul id="log"></ul>
+    </section>
+  </main>
+
+  <script>
+    // Output mixer: plain Web Audio, no libraries. The server (predict.ts) pushes commands over /events.
+    const XFADE = 3.0;          // seconds to crossfade between two music tracks
+    const BED_RMS = 0.15;       // beds and effects are loudness-matched to these before the level is applied
+    const SFX_RMS = 0.20;
+    const $ = id => document.getElementById(id);
+    let ctx, master, analyser, sfxBus, duckGain, duckTimer;
+    const layers = {};          // music / ambience: { level: GainNode, bed: {src, fade}, token }
+    const cache = new Map();    // url -> { buf, norm(rms) , peak }
+
+    function ensureAudio() {
+      if (ctx) return;
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const comp = ctx.createDynamicsCompressor();          // keeps stacked sounds from clipping
+      comp.threshold.value = -14; comp.ratio.value = 4; comp.attack.value = 0.005; comp.release.value = 0.25;
+      master = ctx.createGain(); analyser = ctx.createAnalyser(); analyser.fftSize = 256;
+      duckGain = ctx.createGain();                          // music + ambience dip under speech and effects
+      sfxBus = ctx.createGain();
+      duckGain.connect(master); sfxBus.connect(master);
+      master.connect(comp); comp.connect(analyser); analyser.connect(ctx.destination);
+      for (const name of ["music", "ambience"]) {
+        const level = ctx.createGain(); level.gain.value = 0; level.connect(duckGain);
+        layers[name] = { level, bed: null, token: 0 };
+      }
+      draw();
+    }
+
+    async function load(url) {
+      if (cache.has(url)) return cache.get(url);
+      const arr = await (await fetch(url)).arrayBuffer();
+      const buf = await ctx.decodeAudioData(arr);
+      let peak = 0, sum = 0, n = 0;
+      for (let c = 0; c < buf.numberOfChannels; c++) {
+        const d = buf.getChannelData(c);
+        for (let i = 0; i < d.length; i++) { const a = Math.abs(d[i]); if (a > peak) peak = a; if (i % 8 === 0) { sum += d[i] * d[i]; n++; } }
+      }
+
+      const rms = Math.sqrt(sum / Math.max(1, n)) || 1e-4;
+      const item = { buf, rms, peak: peak || 1 };
+      cache.set(url, item);
+      return item;
+    }
+    const normFor = (it, target) => Math.min(target / it.rms, 0.98 / it.peak, 8);
+    const nameOf = url => decodeURIComponent(url.split("/").pop()).replace(/\.[a-z0-9]+$/i, "");
+
+    // Looping bed with crossfade: new track fades in while the old one fades out, level follows tension.
+    async function setBed(layer, url, level) {
+      const L = layers[layer]; if (!L) return;
+      const token = ++L.token;
+      const it = await load(url);
+      if (token !== L.token) return;                         // a newer command replaced this one while decoding
+      const t = ctx.currentTime;
+      L.level.gain.cancelScheduledValues(t); L.level.gain.setTargetAtTime(level, t, 0.6);
+      const src = ctx.createBufferSource(); src.buffer = it.buf; src.loop = true;   // sample-accurate loop, no gap
+      const norm = ctx.createGain(); norm.gain.value = normFor(it, BED_RMS);
+      const fade = ctx.createGain(); fade.gain.setValueAtTime(0, t); fade.gain.linearRampToValueAtTime(1, t + XFADE);
+      src.connect(norm); norm.connect(fade); fade.connect(L.level); src.start(t);
+      const old = L.bed; L.bed = { src, fade };
+      if (old) {
+        old.fade.gain.cancelScheduledValues(t); old.fade.gain.setValueAtTime(old.fade.gain.value, t);
+        old.fade.gain.linearRampToValueAtTime(0, t + XFADE); old.src.stop(t + XFADE + 0.1);
+      }
+      const id = layer === "music" ? "music" : "amb";
+      $(id + "Name").textContent = nameOf(url); setBar(id, level);
+    }
+    function setLevel(layer, level) {
+      const L = layers[layer]; if (!L) return;
+      L.level.gain.setTargetAtTime(level, ctx.currentTime, 1.2);   // slow ramp: tension changes are felt, not heard as a jump
+      setBar(layer === "music" ? "music" : "amb", level);
+    }
+    const setBar = (id, level) => { $(id + "Bar").style.width = Math.round(Math.min(1, level) * 100) + "%"; $(id + "Lvl").textContent = "level " + level.toFixed(2); };
+
+    // Short dip of the beds so effects and speech stay clear; releases by itself.
+    function duck(holdMs = 2500, depth = 0.55) {
+      if (!ctx) return;
+      const t = ctx.currentTime;
+      duckGain.gain.cancelScheduledValues(t); duckGain.gain.setTargetAtTime(depth, t, 0.08);
+      $("duckTag").classList.add("on"); clearTimeout(duckTimer);
+      duckTimer = setTimeout(() => { duckGain.gain.setTargetAtTime(1, ctx.currentTime, 0.45); $("duckTag").classList.remove("on"); }, holdMs);
+    }
+
+    async function sfx(url, volume) {
+      const it = await load(url);
+      const t = ctx.currentTime, dur = it.buf.duration;
+      const src = ctx.createBufferSource(); src.buffer = it.buf;
+      const norm = ctx.createGain(); norm.gain.value = normFor(it, SFX_RMS);
+      const g = ctx.createGain();                              // 10 ms fade-in, soft fade-out: no clicks, no hard cut
+      g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(volume, t + 0.01);
+      if (dur > 0.4) { const out = Math.min(0.35, dur * 0.3); g.gain.setValueAtTime(volume, t + dur - out); g.gain.linearRampToValueAtTime(0, t + dur); }
+      src.connect(norm); norm.connect(g); g.connect(sfxBus); src.start(t);
+      duck(Math.max(900, dur * 1000), 0.7);
+      log("sfx", nameOf(url), "vol " + volume.toFixed(2));
+    }
+
+    function stopAll() {
+      if (!ctx) return;
+      const t = ctx.currentTime;
+      master.gain.cancelScheduledValues(t); master.gain.setValueAtTime(master.gain.value, t); master.gain.linearRampToValueAtTime(0, t + 2);   // fade out, never a cut
+      setStatus("wait", "Talk ended — fading out");
+      log("", "fade-out", "");
+    }
+
+    function log(cls, text, meta) {
+      const li = document.createElement("li"); li.className = cls;
+      li.innerHTML = `<b></b><span></span>`; li.firstChild.textContent = text; li.lastChild.textContent = (meta ? meta + " · " : "") + new Date().toLocaleTimeString();
+      $("log").prepend(li); while ($("log").children.length > 40) $("log").lastChild.remove();
+    }
+    function setStatus(cls, text) { $("status").className = "pill " + cls; $("statusText").textContent = text; }
+
+    function draw() {
+      const c = $("scope"), g = c.getContext("2d"), data = new Uint8Array(analyser.frequencyBinCount);
+      (function frame() {
+        analyser.getByteFrequencyData(data); g.clearRect(0, 0, c.width, c.height);
+        const w = c.width / data.length;
+        const grad = g.createLinearGradient(0, 0, c.width, 0); grad.addColorStop(0, "#8b5cf6"); grad.addColorStop(1, "#22d3ee");
+        g.fillStyle = grad;
+        data.forEach((v, i) => { const h = (v / 255) * c.height * 0.9; g.fillRect(i * w + 1, c.height - h, w - 3, h); });
+        requestAnimationFrame(frame);
+      })();
+    }
+
+    function handle(m) {
+      if (m.type === "bed") setBed(m.layer, m.url, m.level).catch(e => log("", "load failed", String(e)));
+      else if (m.type === "level") setLevel(m.layer, m.level);
+      else if (m.type === "sfx") sfx(m.url, m.volume).catch(e => log("", "load failed", String(e)));
+      else if (m.type === "duck") duck(m.ms || 2500);
+      else if (m.type === "stop") stopAll();
+    }
+
+    let es;
+    function connect() {
+      es = new EventSource("/events");
+      es.onopen = () => { master.gain.cancelScheduledValues(ctx.currentTime); master.gain.setTargetAtTime(1, ctx.currentTime, 0.2); setStatus("live", "Live — listening to the prediction engine"); fetch("/ready", { method: "POST" }); };   // ready only once the stream is open, so no early cue is lost
+      es.onmessage = e => handle(JSON.parse(e.data));
+      es.onerror = () => { setStatus("wait", "Disconnected — fading out"); stopAll(); };    // server gone = talk over
+    }
+    $("start").onclick = async () => {
+      ensureAudio(); await ctx.resume();
+      $("start").hidden = true; $("hint").textContent = "Audio is on. Keep this tab open while you talk.";
+      connect();
+    };
+  </script>
+</body>
+
+</html>

@@ -33,6 +33,11 @@ export interface PipelineOpts {
   concurrency: number;
   budgetMs: number; // soft target; after half of it Apify is skipped
   musicLengthS: number;
+  // ElevenLabs use: "fallback" = only when search finds nothing (default) | "sfx" = also add one generated
+  // variant to every SFX slot | "all" = generate first (music beds too), search only if generation fails
+  generate?: "fallback" | "sfx" | "all";
+  // candidates to collect before searching stops (default 6). A first batch uses ~3: one search per sound, not six
+  minCandidates?: number;
 }
 
 export const DEFAULT_OPTS: PipelineOpts = { variants: 2, concurrency: 6, budgetMs: 100_000, musicLengthS: 60 };
@@ -113,52 +118,100 @@ async function resolveSlot(slot: Slot, ctx: SlotCtx): Promise<ResolvedSound[]> {
   if (slot.kind === "voice") return resolveVoice(slot, ctx);
   const want = slot.kind === "sfx" ? ctx.opts.variants : 1;
 
+  const mode = ctx.opts.generate ?? "fallback";
+  if (mode === "all") {
+    const g = await generateFor(slot, ctx);
+    if (g) return [g];
+  }
+
   // 1) search, 2) rank, 3) download the best that actually download
   const candidates = await searchSlot(slot, ctx);
   const ranked = rankCandidates(slot, candidates).filter((c) => !ctx.usedSourceIds.has(key(c)));
   const out: ResolvedSound[] = [];
-  for (const c of ranked) {
-    if (out.length >= want) break;
+  const tryGet = async (c: Candidate) => {
     ctx.usedSourceIds.add(key(c)); // claim before awaiting so parallel slots don't pick the same file
     try {
       const { bytes, contentType } = await ctx.providers.download(c.audioUrl);
       if (bytes.byteLength < 1000) throw new Error("file too small");
-      out.push({ slot, variant: out.length, candidate: c, bytes, contentType });
+      return { slot, variant: 0, candidate: c, bytes, contentType } as ResolvedSound;
     } catch (err) {
       ctx.log(`${slot.id}: download failed for ${c.source}:${c.sourceId} (${String(err)})`);
+      return null;
     }
+  };
+  let next = 0;
+  while (out.length < want && next < ranked.length) {
+    const batch = ranked.slice(next, next + (want - out.length)); // parallel for the ones still needed
+    next += batch.length;
+    for (const r of await Promise.all(batch.map(tryGet))) if (r) out.push({ ...r, variant: out.length });
   }
-  if (out.length) return out;
+  if (out.length) {
+    if (mode === "sfx" && slot.kind === "sfx") {
+      const g = await generateFor(slot, ctx);
+      if (g) out.push({ ...g, variant: out.length });
+    }
+    return out;
+  }
 
   // 4) nothing usable → generate one
   const gen = await generateFor(slot, ctx);
   return gen ? [gen] : [];
 }
 
+/** Provider health, shared across a run: stops us burning requests on a provider that is rate-limited or out of credits. */
+const health = { fsBlockedUntil: 0, fsBackoffMs: 60_000, genOutOfCredits: false, said: new Set<string>() };
+
+export function providerStatus() {
+  const now = Date.now();
+  return {
+    freesoundBlockedS: Math.max(0, Math.ceil((health.fsBlockedUntil - now) / 1000)),
+    generationOutOfCredits: health.genOutOfCredits,
+    stuck: now < health.fsBlockedUntil && health.genOutOfCredits,
+  };
+}
+
+function sayOnce(ctx: SlotCtx, key: string, msg: string) {
+  if (health.said.has(key)) return;
+  health.said.add(key);
+  ctx.log(msg);
+}
+
 async function searchSlot(slot: SfxSlot | MusicSlot, ctx: SlotCtx): Promise<Candidate[]> {
   const { freesound, apify } = ctx.providers;
   const all: Candidate[] = [];
-  const enough = () => all.length >= 6; // keeps Freesound under its per-minute limit
+  const enough = () => all.length >= (ctx.opts.minCandidates ?? 6); // keeps Freesound under its per-minute limit
 
   // Duration windows, tightest first. SFX must stay short; drones/music can be long loops.
   const windows =
     slot.kind === "music"
       ? [{ minDurationS: 20, maxDurationS: 240, loop: true }, { minDurationS: 20, maxDurationS: 300 }]
-      : slot.id === "drone"
+      : isBedSlot(slot)
         ? [{ minDurationS: 5, maxDurationS: 60, loop: true }, { minDurationS: 5, maxDurationS: 60 }]
-        : [{ minDurationS: 0.1, maxDurationS: slot.maxDurationS }, { minDurationS: 0.1, maxDurationS: slot.maxDurationS * 2 }];
+        : [{ minDurationS: slot.lengthS ? Math.max(0.1, slot.lengthS * 0.3) : 0.1, maxDurationS: slot.maxDurationS }, { minDurationS: 0.1, maxDurationS: slot.maxDurationS * 2 }];
 
-  if (freesound) {
-    outer: for (const w of windows) {
-      for (const q of slot.queries) {
+  if (freesound && Date.now() >= health.fsBlockedUntil) {
+    // all queries of a window run at the same time: the same candidate pool as before, in ~1 search of wall time
+    for (const w of windows) {
+      let limited = false;
+      const results = await Promise.all(slot.queries.map(async (q) => {
         try {
-          all.push(...(await freesound(q, w)));
+          const r = await freesound(q, w);
+          health.fsBackoffMs = 60_000; // a good answer: the limit is over
+          return r;
         } catch (err) {
-          ctx.log(`${slot.id}: freesound "${q}" ${String(err)}`);
-          if (String(err).includes("rate limit")) break outer;
+          if (String(err).includes("rate limit")) {
+            limited = true;
+            if (Date.now() >= health.fsBlockedUntil) { // first failure of this block: pause every search, with growing back-off
+              health.fsBlockedUntil = Date.now() + health.fsBackoffMs;
+              sayOnce(ctx, `fs${health.fsBlockedUntil}`, `Freesound rate limit hit: searches paused for ${Math.round(health.fsBackoffMs / 1000)} s (the API allows ~60 requests/min and ~2000/day)`);
+              health.fsBackoffMs = Math.min(health.fsBackoffMs * 2, 600_000);
+            }
+          } else ctx.log(`${slot.id}: freesound "${q}" ${String(err)}`);
+          return [] as Candidate[];
         }
-        if (enough()) break outer;
-      }
+      }));
+      for (const r of results) all.push(...r);
+      if (enough() || limited) break;
     }
   }
   if (apify && all.length < 2 && !ctx.pastHalf()) {
@@ -173,14 +226,15 @@ async function searchSlot(slot: SfxSlot | MusicSlot, ctx: SlotCtx): Promise<Cand
 
 async function generateFor(slot: SfxSlot | MusicSlot, ctx: SlotCtx): Promise<ResolvedSound | null> {
   const { genSfx, genMusic } = ctx.providers;
+  if (health.genOutOfCredits) return null; // the account has no credits: don't spend a request per sound finding that out
   try {
     let audio: GeneratedAudio | null = null;
     if (slot.kind === "music") {
       if (genMusic) audio = await genMusic(slot.genPrompt, ctx.opts.musicLengthS);
       else if (genSfx) audio = await genSfx(slot.genPrompt, { durationS: 20, loop: true }); // cheaper loop bed
     } else if (genSfx) {
-      const loop = slot.id === "drone";
-      audio = await genSfx(slot.genPrompt, { durationS: loop ? 15 : Math.max(0.5, slot.maxDurationS), loop });
+      const loop = isBedSlot(slot);
+      audio = await genSfx(slot.genPrompt, { durationS: loop ? 15 : Math.max(0.5, slot.lengthS ?? slot.maxDurationS), loop });
     }
     if (!audio) return null;
     return {
@@ -199,7 +253,10 @@ async function generateFor(slot: SfxSlot | MusicSlot, ctx: SlotCtx): Promise<Res
       contentType: audio.contentType,
     };
   } catch (err) {
-    ctx.log(`${slot.id}: generation failed ${String(err)}`);
+    if (/quota_exceeded|credits remaining/i.test(String(err))) {
+      health.genOutOfCredits = true;
+      sayOnce(ctx, "gen-credits", "ElevenLabs is out of credits: generation is switched off for this run (sounds can only come from Freesound)");
+    } else ctx.log(`${slot.id}: generation failed ${String(err)}`);
     return null;
   }
 }
@@ -254,8 +311,11 @@ export function rankCandidates(slot: SfxSlot | MusicSlot, cands: Candidate[]): C
     const popularity = Math.log10((c.downloads ?? 0) + 1) / 5; // ~0–1
     const rating = (c.rating ?? 0) / 5;
     let durationFit = 0;
-    if (slot.kind === "sfx" && slot.id !== "drone" && c.durationS > 0) {
-      durationFit = c.durationS <= slot.maxDurationS ? 0.3 : -0.4 * (c.durationS / slot.maxDurationS - 1);
+    if (slot.kind === "sfx" && !isBedSlot(slot) && c.durationS > 0) {
+      // the planner's own length is the target: closest (in ratio) wins; clips far too short or far too long lose
+      durationFit = slot.lengthS
+        ? 0.3 - 0.5 * Math.min(1, Math.abs(Math.log2(c.durationS / slot.lengthS)) / 2)
+        : c.durationS <= slot.maxDurationS ? 0.3 : -0.4 * (c.durationS / slot.maxDurationS - 1);
     }
     if (slot.kind === "music" && have.has("loop")) durationFit += 0.2;
     const cc0 = c.license === "CC0" ? 0.05 : 0; // tie-breaker: no credit needed
@@ -280,8 +340,9 @@ function toRecord(r: ResolvedSound): SoundRecord {
     mood: s.kind === "music" ? s.mood : undefined,
     // Voice effects are always committed (spec: highest margin, peak moments only)
     safety: s.kind === "sfx" ? s.safety : s.kind === "music" ? "speculative" : "committed",
+    ...(s.kind === "sfx" ? { instant: s.instant, emphasis: s.emphasis, softness: s.softness, attack: s.attack, tail: s.tail, lengthS: s.lengthS, description: s.event } : {}),
     durationMs: Math.round(r.candidate.durationS * 1000), // 0 = unknown; player reads it from the decoded buffer
-    loop: s.kind === "music" || s.id === "drone",
+    loop: s.kind === "music" || (s.kind === "sfx" && isBedSlot(s)),
     source: r.candidate.source,
     sourceId: r.candidate.sourceId,
     license: r.candidate.license,
@@ -292,6 +353,8 @@ function toRecord(r: ResolvedSound): SoundRecord {
 
 const labelOf = (s: Slot) => (s.kind === "music" ? `music: ${s.mood}` : s.kind === "voice" ? `voice: "${s.line}"` : s.label);
 const key = (c: Candidate) => `${c.source}:${c.sourceId}`;
+/** Long, loopable background beds (drone, ambience, room tone) as opposed to short one-shot effects. */
+const isBedSlot = (s: SfxSlot | MusicSlot) => s.kind === "sfx" && (s.id === "drone" || /ambien|atmos|drone|room_?tone/i.test(`${s.id} ${s.label}`));
 
 async function mapLimit<T>(items: T[], limit: number, fn: (x: T) => Promise<void>) {
   let i = 0;
