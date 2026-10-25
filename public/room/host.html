@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#ff6a1a">
+  <title>Host a story</title>
+  <link rel="stylesheet" href="/room/style.css">
+</head>
+<body>
+  <main class="screen plain">
+    <div class="top"><a href="/" aria-label="Back">‹</a><h1>Host a story</h1></div>
+    <div class="msg bad" id="error" hidden></div>
+
+    <section id="startStep">
+      <div class="status"><div class="big">Share your story's sound</div>
+        <p class="hint">You'll get a six-digit code. People in the room enter it on their phones, and each phone becomes a speaker for your story.</p></div>
+      <div class="actions"><button class="primary" id="createBtn">Become host</button></div>
+    </section>
+
+    <section id="roomStep" hidden>
+      <div class="panel">
+        <div class="label">Story code</div>
+        <div class="code" id="code">——————</div>
+        <p class="hint" style="text-align:center;margin:4px 0 12px">Join at <b id="joinUrl"></b></p>
+        <button class="secondary" id="shareBtn">Share link</button>
+      </div>
+
+      <div class="panel counts">
+        <div><b id="connected">0</b><span class="hint">Connected</span></div>
+        <div><b id="ready">0</b><span class="hint">Ready</span></div>
+      </div>
+
+      <div class="msg warn" id="mutedMsg" hidden></div>
+
+      <!-- the talk, when this server runs it (room/talks.ts); hidden on a laptop-run room -->
+      <div class="panel" id="talkPanel" hidden>
+        <div class="label">Your story</div>
+        <form id="setupForm" hidden>
+          <input id="theme" type="text" maxlength="200" placeholder="What's your story about?" aria-label="What's your story about?" required>
+          <div class="row" style="margin-top:10px">
+            <input id="minutes" type="text" inputmode="numeric" maxlength="3" value="3" aria-label="Minutes" style="flex:0 0 72px;text-align:center">
+            <span class="hint" style="align-self:center">minutes</span>
+          </div>
+          <input id="sounds" type="text" maxlength="300" placeholder="Sounds you want, e.g. door, thunder (optional)" style="margin-top:10px">
+          <button class="primary" id="buildBtn" type="submit" style="margin-top:12px">Get the sounds</button>
+          <div id="savedBox" hidden>
+            <div class="label" style="margin-top:16px">Or reuse a story</div>
+            <div id="saved" style="display:flex;flex-direction:column;gap:8px"></div>
+          </div>
+        </form>
+        <div id="buildBox" hidden>
+          <div class="hint" id="buildMsg">Planning the sounds…</div>
+          <div class="progress"><div id="buildProgress"></div></div>
+        </div>
+        <div id="readyBox" hidden>
+          <p style="margin:0 0 6px"><b id="readyTheme"></b></p>
+          <p class="hint" style="margin:0" id="readyInfo"></p>
+          <button class="secondary" id="changeBtn" style="margin-top:10px">Change story</button>
+        </div>
+        <form id="sayForm" hidden>
+          <button class="primary" type="button" id="micBtn">Use microphone</button>
+          <div id="micBox" hidden style="margin-top:10px">
+            <div class="progress" aria-label="Microphone level"><div id="micLevel"></div></div>
+            <p class="hint" id="micText" style="margin:8px 0 0;min-height:1.45em"></p>
+            <p class="hint" style="margin:4px 0 0">Hold the phone close to your mouth so it hears you, not the speakers.</p>
+          </div>
+          <p class="hint" id="typeHint" style="margin:12px 0 8px">Or type the story a sentence at a time:</p>
+          <div class="row"><input id="line" type="text" maxlength="1000" placeholder="The door creaked open…" aria-label="Next sentence"><button class="secondary" type="submit" style="flex:0 0 84px">Send</button></div>
+          <div class="row" style="margin-top:10px">
+            <button class="secondary" type="button" id="wrongBtn">Wrong sound</button>
+            <button class="secondary" type="button" id="goodBtn">Good sound</button>
+          </div>
+          <button class="danger" type="button" id="endTalkBtn" style="margin-top:10px">End talk</button>
+        </form>
+        <pre id="talkLog" hidden style="margin:12px 0 0;max-height:180px;overflow:auto;font:12px/1.45 var(--mono);white-space:pre-wrap;background:#f6f6f6;border-radius:10px;padding:10px"></pre>
+      </div>
+
+      <div class="panel">
+        <div class="label">Talk</div>
+        <div class="row" style="margin-bottom:10px">
+          <button class="secondary" id="testBtn">Test sound</button>
+          <button class="primary" id="startBtn">Start talk</button>
+        </div>
+        <div class="row">
+          <button class="secondary" id="muteBtn">Mute all</button>
+          <button class="secondary" id="lockBtn">Lock joining</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <label class="toggle">Play on this phone too <input type="checkbox" id="hostSpeaker"></label>
+        <p class="hint" style="margin:4px 0 0" id="hostSpeakerHint">Off by default: if this phone is near the microphone, its sound can be picked up by the talk.</p>
+      </div>
+
+      <div class="panel">
+        <div class="label">Phones</div>
+        <ul class="members" id="members"><li class="hint">No phones yet. Share the code.</li></ul>
+      </div>
+
+      <div class="actions"><button class="danger" id="endBtn">End room</button></div>
+    </section>
+
+    <section id="endStep" hidden>
+      <div class="status"><div class="big" id="endTitle">Room ended</div><p class="hint" id="endHint"></p></div>
+      <div class="actions"><a class="button primary" href="/host">Host another story</a><a class="button secondary" href="/">Home</a></div>
+    </section>
+  </main>
+
+  <script type="module">
+    import { RoomConnection } from "/room/connection.js";
+    import { MemberSession } from "/room/member.js";
+    import { MicStream, MIC_ERRORS } from "/room/mic.js";
+    const $ = id => document.getElementById(id);
+    const STATE = { enabling_sound: "Enabling sound", loading: "Loading", synchronizing: "Synchronizing", ready: "Ready", degraded: "Degraded", disconnected: "Disconnected" };
+    const ERRORS = { rate_limited: "Too many rooms created from this network. Wait a minute.", create_forbidden: "Rooms can only be created from the presenter's machine on this server.", unknown_asset: "No sounds are loaded yet, so there's nothing to test." };
+    const ENDED = { ended: "You ended the room.", expired: "Rooms close after 4 hours.", idle: "The room closed after 30 minutes without activity.", host_timeout: "You were away too long, so the room closed.", server_restart: "The server restarted." };
+
+    const conn = new RoomConnection({ role: "host" });
+    let room = null, view = null, started = false, mySpeaker = null;
+    conn.onOpenFresh = () => { if (wantCreate) conn.send("room.create", {}); };
+    let wantCreate = false;
+
+    function show(step) { for (const id of ["startStep", "roomStep", "endStep"]) $(id).hidden = id !== step; }
+    function error(text) { $("error").hidden = !text; $("error").textContent = text || ""; }
+
+    conn.on("room.created", m => { room = m; show("roomStep"); renderCode(); });
+    conn.on("room.joined", m => { room = { ...room, ...m }; show("roomStep"); renderCode(); });  // host reconnected
+    conn.on("room.members", m => { view = m; renderMembers(); });
+    conn.on("talk.status", renderTalk);
+    conn.on("room.closed", m => end(m.reason));
+    conn.on("expired", () => end("expired"));
+    conn.on("error", m => error(ERRORS[m.code] || m.message));
+    conn.on("disconnected", () => error("Connection lost — reconnecting. The room is muted until you're back and press Resume."));
+    conn.on("connected", () => error(""));
+
+    function renderCode() {
+      $("code").textContent = room.code.replace(/(\d{3})(\d{3})/, "$1 $2");
+      $("joinUrl").textContent = `${location.host}/join`;
+    }
+    function renderMembers() {
+      $("connected").textContent = view.connected; $("ready").textContent = view.ready;
+      $("muteBtn").textContent = view.muted ? "Resume audio" : "Mute all";
+      $("lockBtn").textContent = view.locked ? "Unlock joining" : "Lock joining";
+      $("mutedMsg").hidden = !view.muted;
+      $("mutedMsg").textContent = "All phones are muted. Press Resume audio to bring the sound back.";
+      const ul = $("members"); ul.innerHTML = "";
+      if (!view.members.length) { ul.innerHTML = '<li class="hint">No phones yet. Share the code.</li>'; return; }
+      for (const m of view.members) {
+        const li = document.createElement("li");
+        const name = document.createElement("span"); name.className = "name"; name.textContent = m.displayName;
+        const badge = document.createElement("span"); badge.className = `badge ${m.state}`; badge.textContent = STATE[m.state] || m.state;
+        if (m.lastSkip) badge.title = `last skipped: ${m.lastSkip.reason}`;
+        const rm = document.createElement("button"); rm.className = "danger"; rm.textContent = "Remove";
+        rm.onclick = () => { if (confirm(`Remove ${m.displayName}?`)) conn.send("host.remove", { memberId: m.memberId }); };
+        li.append(name, badge, rm); ul.append(li);
+      }
+    }
+    // ---- the talk panel (server-run talks only) ----
+    let talk = null;
+    const LOG_KEEP = /^\[(HEARD|PLAY|STREAM|INSTANT|ROOM|TIME|CMD)\]|^(Setup loaded|Sound plan|Host pressed|Listening|Type the story)/;
+    function renderTalk(t) {
+      talk = t;
+      $("talkPanel").hidden = false;
+      const editable = t.phase === "setup" || t.phase === "failed" || t.phase === "ended";   // ended: set up the next talk
+      $("setupForm").hidden = !editable;
+      $("buildBox").hidden = t.phase !== "building";
+      $("readyBox").hidden = t.phase !== "ready";
+      $("sayForm").hidden = t.phase !== "running";
+      if (t.error) error(t.error); else if (!$("error").textContent.startsWith("Connection")) error("");
+      if (t.progress) {
+        $("buildMsg").textContent = t.progress.message || "Getting the sounds…";
+        $("buildProgress").style.width = `${Math.round(100 * t.progress.completed / Math.max(1, t.progress.total))}%`;
+      }
+      $("readyTheme").textContent = t.theme || "";
+      $("readyInfo").textContent = `${t.sounds} sounds ready. Phones are loading them — press Start talk when they're Ready.`;
+      if (t.saved) {
+        $("savedBox").hidden = !t.saved.length;
+        const box = $("saved"); box.innerHTML = "";
+        for (const s of t.saved) {
+          const b = document.createElement("button"); b.type = "button"; b.className = "secondary"; b.textContent = s.theme;
+          b.onclick = () => conn.send("host.useSession", { sessionId: s.id }); box.append(b);
+        }
+      }
+      // log: only the lines a presenter cares about (what was heard, what played)
+      const log = $("talkLog");
+      if (t.logReset) log.textContent = "";
+      const lines = (t.log || []).filter(l => LOG_KEEP.test(l));
+      if (lines.length) { log.hidden = false; log.textContent += lines.join("\n") + "\n"; log.scrollTop = log.scrollHeight; }
+      $("startBtn").disabled = t.phase !== "ready";
+      $("startBtn").textContent = t.phase === "running" ? "Talk running" : t.phase === "ended" ? "Talk ended" : "Start talk";
+    }
+    $("setupForm").onsubmit = e => {
+      e.preventDefault();
+      const theme = $("theme").value.trim();
+      if (!theme) return;
+      const minutes = Math.min(120, Math.max(1, Number($("minutes").value) || 3));
+      conn.send("host.setup", { theme, minutes, sounds: $("sounds").value.trim() });
+    };
+    $("changeBtn").onclick = () => { renderTalk({ ...talk, phase: "setup", saved: talk.saved }); };
+    $("sayForm").onsubmit = e => {
+      e.preventDefault();
+      const text = $("line").value.trim();
+      if (!text) return;
+      conn.send("host.say", { text }); $("line").value = ""; $("line").focus();
+    };
+    // ---- microphone: the talk's input, streamed to the server ----
+    const mic = new MicStream({
+      onState: s => {
+        $("micBtn").textContent = s === "live" ? "Stop microphone" : s === "starting" ? "Starting…" : "Use microphone";
+        $("micBtn").className = s === "off" ? "primary" : "secondary";
+        $("micBox").hidden = s === "off";
+        if (s === "live") { $("micText").textContent = "Listening…"; error(""); }
+      },
+      onLevel: rms => { $("micLevel").style.width = `${Math.min(100, Math.round(rms * 400))}%`; },
+      onTranscript: (text, final) => { $("micText").textContent = text; $("micText").style.color = final ? "var(--ink)" : ""; },
+      onError: code => error(MIC_ERRORS[code] || `Microphone stopped (${code}).`),
+    });
+    $("micBtn").onclick = () => { if (mic.state === "off") mic.start(conn.token); else mic.stop(); };
+    conn.on("talk.status", t => { if (t.phase !== "running" && mic.state !== "off") mic.stop(); });
+
+    $("wrongBtn").onclick = () => conn.send("host.command", { command: "skip" });
+    $("goodBtn").onclick = () => conn.send("host.command", { command: "good" });
+    $("endTalkBtn").onclick = () => { if (confirm("End the talk? Phones stay connected.")) conn.send("host.command", { command: "end" }); };
+
+    function end(reason) {
+      mySpeaker?.leave(); mySpeaker = null;
+      mic.stop();
+      $("endHint").textContent = ENDED[reason] || ""; show("endStep");
+    }
+
+    $("createBtn").onclick = () => { wantCreate = true; $("createBtn").disabled = true; conn.connect(); };
+    $("testBtn").onclick = () => conn.send("host.test", {});
+    $("startBtn").onclick = () => {
+      if (view && view.ready === 0 && !confirm("No phones are Ready yet. Start anyway?")) return;
+      conn.send("host.start", {}); started = true;
+      if (!talk) { $("startBtn").disabled = true; $("startBtn").textContent = "Talk running"; } // laptop-run talk: no status comes back
+    };
+    $("muteBtn").onclick = () => conn.send(view?.muted ? "host.resume" : "host.mute", {});
+    $("lockBtn").onclick = () => conn.send("host.lock", { locked: !view?.locked });
+    $("endBtn").onclick = () => { if (confirm("End the room for everyone?")) conn.send("host.end", {}); };
+    $("shareBtn").onclick = async () => {
+      const url = `${location.origin}/join?code=${room.code}`;
+      try { if (navigator.share) await navigator.share({ title: "Join my story", text: `Code ${room.code}`, url }); else { await navigator.clipboard.writeText(url); $("shareBtn").textContent = "Link copied"; } } catch { /* cancelled */ }
+    };
+    // this phone as a speaker too: a member connection of its own, through the same scheduled path as everyone else
+    $("hostSpeaker").onchange = async e => {
+      if (e.target.checked) {
+        mySpeaker = new MemberSession(s => { $("hostSpeakerHint").textContent = s.status === "ready" ? "This phone is Ready and plays with the others." : `This phone: ${s.status.replace("_", " ")}`; });
+        mySpeaker.join(room.code, "Host phone");
+        await mySpeaker.enable();
+      } else { mySpeaker?.leave(); mySpeaker = null; $("hostSpeakerHint").textContent = "This phone is silent."; }
+    };
+
+    // reload while hosting: pick the room back up with this tab's host token
+    if (conn.token) conn.connect();
+  </script>
+</body>
+</html>

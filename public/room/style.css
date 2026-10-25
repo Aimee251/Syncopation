@@ -1,0 +1,86 @@
+/* Speaker room pages: phone-first, after the Syncopation home mockup (orange → yellow → white, + grid, pill buttons). */
+:root {
+  --orange: #ff6a1a;
+  --amber: #ffb627;
+  --yellow: #ffd23f;
+  --ink: #111;
+  --muted: #6b6b6b;
+  --line: #e7e7e7;
+  --card: #fbfbfb;
+  --ok: #1f9d55;
+  --warn: #c77700;
+  --bad: #c62828;
+  --mono: ui-monospace, "SF Mono", "Roboto Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  font-family: var(--sans); color: var(--ink); background: #777;
+  display: flex; justify-content: center; align-items: stretch; padding: 16px;
+}
+.screen {
+  width: 100%; max-width: 420px; min-height: calc(100dvh - 32px); border-radius: 28px; overflow: hidden; position: relative;
+  display: flex; flex-direction: column; padding: 24px 20px 28px;
+  background:
+    linear-gradient(180deg, var(--orange) 0%, var(--amber) 18%, var(--yellow) 26%, #fff7e0 40%, rgba(255,255,255,0) 52%),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='28' height='28'%3E%3Cpath d='M14 9v10M9 14h10' stroke='%23e9e9e9' stroke-width='1.2'/%3E%3C/svg%3E"),
+    var(--card);
+}
+.screen.plain { background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='28' height='28'%3E%3Cpath d='M14 9v10M9 14h10' stroke='%23ececec' stroke-width='1.2'/%3E%3C/svg%3E"), var(--card); }
+.brand { display: flex; flex-direction: column; align-items: center; gap: 18px; margin: auto 0; }
+.brand svg { width: 140px; height: auto; }
+.wordmark { font-family: var(--mono); letter-spacing: 0.08em; font-size: 15px; }
+.top { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+.top a { color: var(--ink); text-decoration: none; font-size: 22px; line-height: 1; padding: 4px 8px 4px 0; }
+.top h1 { font-size: 18px; margin: 0; font-weight: 600; }
+.actions { display: flex; flex-direction: column; gap: 12px; margin-top: auto; }
+button, .button {
+  font: inherit; font-size: 16px; border-radius: 999px; padding: 15px 20px; border: 0; cursor: pointer; width: 100%;
+  text-align: center; text-decoration: none; display: block; -webkit-tap-highlight-color: transparent;
+}
+.primary { color: #fff; background: linear-gradient(180deg, #ff8a3d, var(--orange)); box-shadow: 0 0 0 3px var(--yellow), 0 6px 18px rgba(255,106,26,.35); }
+.secondary { color: var(--ink); background: #fff; box-shadow: 0 0 0 1.5px var(--line) inset; }
+.danger { color: var(--bad); background: #fff; box-shadow: 0 0 0 1.5px #f3c6c6 inset; }
+button:disabled { opacity: .45; cursor: default; }
+.row { display: flex; gap: 10px; }
+.row > * { flex: 1; }
+.panel { background: #fff; border-radius: 18px; padding: 16px; box-shadow: 0 0 0 1px var(--line); margin-bottom: 14px; }
+.label { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 6px; }
+.code { font-family: var(--mono); font-size: 44px; letter-spacing: .12em; text-align: center; margin: 4px 0; }
+.counts { display: flex; justify-content: space-around; text-align: center; }
+.counts b { display: block; font-size: 28px; }
+.hint { color: var(--muted); font-size: 14px; line-height: 1.45; }
+.msg { border-radius: 14px; padding: 12px 14px; font-size: 14px; margin-bottom: 14px; }
+.msg.bad { background: #fdecec; color: var(--bad); }
+.msg.warn { background: #fff4e0; color: var(--warn); }
+input[type=text] {
+  font: inherit; width: 100%; padding: 14px 16px; border-radius: 14px; border: 1.5px solid var(--line); background: #fff; font-size: 16px;
+}
+input.code-input { font-family: var(--mono); font-size: 34px; letter-spacing: .3em; text-align: center; padding: 12px 8px; }
+input:focus { outline: 2px solid var(--amber); border-color: transparent; }
+input[type=range] { width: 100%; accent-color: var(--orange); }
+.members { list-style: none; margin: 0; padding: 0; }
+.members li { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-top: 1px solid var(--line); }
+.members li:first-child { border-top: 0; }
+.members .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.members button { width: auto; padding: 6px 12px; font-size: 13px; }
+.badge { font-size: 12px; padding: 3px 9px; border-radius: 999px; background: #eee; color: var(--muted); white-space: nowrap; }
+.badge.ready { background: #e3f5ea; color: var(--ok); }
+.badge.degraded, .badge.loading, .badge.synchronizing, .badge.enabling_sound { background: #fff4e0; color: var(--warn); }
+.badge.disconnected { background: #fdecec; color: var(--bad); }
+.status { text-align: center; margin: 18px 0; }
+.status .big { font-size: 26px; font-weight: 600; margin-bottom: 6px; }
+.dot { width: 14px; height: 14px; border-radius: 50%; display: inline-block; margin-right: 8px; vertical-align: middle; background: var(--warn); }
+.dot.ready { background: var(--ok); }
+.dot.bad { background: var(--bad); }
+.progress { height: 6px; background: #eee; border-radius: 3px; overflow: hidden; margin-top: 10px; }
+.progress > div { height: 100%; background: var(--orange); width: 0; transition: width .2s; }
+.toggle { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px 0; }
+.toggle input { width: 22px; height: 22px; accent-color: var(--orange); }
+.sheet-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,.25); display: none; }
+.sheet { position: absolute; left: 0; right: 0; bottom: 0; background: #fff; border-radius: 24px 24px 0 0; padding: 22px 20px 28px; display: none; flex-direction: column; gap: 12px; }
+.sheet h2 { margin: 0 0 4px; font-size: 18px; }
+.open .sheet-backdrop { display: block; }
+.open .sheet { display: flex; }
+[hidden] { display: none !important; }

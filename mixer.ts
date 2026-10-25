@@ -12,6 +12,8 @@ import { dirname, extname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import * as player from "./player";
+import type { RoomSink } from "./room/engine";
+import { childSink, inTalkChild } from "./room/talkBridge";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const ROOT = process.cwd();
@@ -73,11 +75,27 @@ export function waitForBrowser(open = true): Promise<void> {
   return ready && clients.size ? Promise.resolve() : new Promise(r => readyWaiters.push(r));
 }
 
+// ---- speaker room: phones play every sound in sync; nothing plays from this machine, so nothing plays twice ----
+//   --room            this process serves the room itself (laptop mode)
+//   SYNC_ROOM_IPC=1   the room server started this process for one room's talk: calls go to the parent
+let room: RoomSink | null = inTalkChild() ? childSink() : null;
+export async function startRoom(files: string[], log?: (m: string) => void) {
+  const { startRoomHost } = await import("./room/host");
+  const host = await startRoomHost({ files, log });
+  room = host.engine;
+  return host;
+}
+
 // ---- same API as player.ts ----
-export const playerReady = () => started || player.playerReady();
-export const playerName = () => (started ? "browser mixer " + mixerUrl : player.playerName());
+export const playerReady = () => !!room || started || player.playerReady();
+export const playerName = () => (room ? "speaker room" : started ? "browser mixer " + mixerUrl : player.playerName());
 
 export function playOnce(file: string | undefined, volume: number, opts: { role?: string; liftDb?: number; attackMs?: number; releaseMs?: number; maxS?: number; lowpassHz?: number; wet?: number } = {}): boolean {
+  if (room) {
+    // phones get level, attack, release and length; lowpass and reverb (lowpassHz, wet) aren't sent yet
+    const v = opts.liftDb !== undefined ? player.fxGainFor(opts.liftDb, room.level("music") ?? room.level("ambience")) : volume;
+    return room.playOnce(file, Math.max(0, Math.min(1, v)), opts);
+  }
   if (!mixerActive()) return player.playOnce(file, volume, opts);
   if (!file || !existsSync(file)) return false;
   const v = opts.liftDb !== undefined ? player.fxGainFor(opts.liftDb, state.music?.level ?? state.ambience?.level) : volume;
@@ -86,6 +104,7 @@ export function playOnce(file: string | undefined, volume: number, opts: { role?
 }
 
 export function setLoop(layer: "music" | "ambience", file: string | undefined, volume: number) {
+  if (room) return room.setLoop(layer, file, volume);
   if (!mixerActive()) return player.setLoop(layer, file, volume);
   if (!file || !existsSync(file)) return;
   const prev = state[layer];
@@ -95,6 +114,7 @@ export function setLoop(layer: "music" | "ambience", file: string | undefined, v
 }
 
 export function setLevel(layer: "music" | "ambience", volume: number) {
+  if (room) return room.setLevel(layer, volume);
   if (!mixerActive()) return player.setLevel(layer, volume);
   const cur = state[layer];
   if (!cur || Math.abs(cur.level - volume) < 0.03) return;    // the browser ramps smoothly, so small steps are fine
@@ -103,10 +123,17 @@ export function setLevel(layer: "music" | "ambience", volume: number) {
 }
 
 /** Speech is happening: dip the beds a little so the voice stays clear */
-export function duck(ms = 2500) { player.speaking(); if (mixerActive()) send({ type: "duck", ms }); }
-export { preload, pickCompatible, setMixLogger, soundProfile } from "./player";
+export function duck(ms = 2500) { player.speaking(); if (room) room.duck(ms); else if (mixerActive()) send({ type: "duck", ms }); }
+export { pickCompatible, setMixLogger, soundProfile } from "./player";
+
+/** Analyse sounds for mixing; in a room, also announce their files so phones load them before any cue needs them. */
+export function preload(sounds: { file?: string; role: string; id: string }[]): string[] {
+  room?.register(sounds.map(s => s.file));
+  return player.preload(sounds);
+}
 
 export function stopAll() {
+  room?.stopAll();
   if (mixerActive()) { send({ type: "stop" }); for (const k of Object.keys(state)) delete state[k]; }
   player.stopAll();
 }

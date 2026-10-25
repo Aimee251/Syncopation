@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#ff6a1a">
+  <title>Join a story</title>
+  <link rel="stylesheet" href="/room/style.css">
+</head>
+<body>
+  <main class="screen plain">
+    <div class="top"><a href="/" aria-label="Back">‹</a><h1>Join a story</h1></div>
+    <div class="msg bad" id="error" hidden></div>
+
+    <!-- 1. code -->
+    <form id="codeStep" autocomplete="off">
+      <div class="panel">
+        <div class="label">Story code</div>
+        <input class="code-input" id="code" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" placeholder="000000" aria-label="Six-digit story code">
+        <div class="label" style="margin-top:14px">Your name (optional)</div>
+        <input id="name" type="text" maxlength="32" placeholder="e.g. Sam's phone">
+      </div>
+      <p class="hint">Your phone becomes one of the room's speakers and will play the story's sound. It won't use your microphone.</p>
+      <div class="actions"><button class="primary" id="joinBtn" type="submit" disabled>Join</button></div>
+    </form>
+
+    <!-- 2. enable sound (needs a tap) -->
+    <section id="enableStep" hidden>
+      <div class="status"><div class="big">You're in</div><p class="hint">Tap below so this phone can play sound. Turn your volume up and keep this page open.</p></div>
+      <div class="actions"><button class="primary" id="enableBtn">Enable sound</button></div>
+    </section>
+
+    <!-- 3. playing -->
+    <section id="liveStep" hidden>
+      <div class="status">
+        <div class="big"><span class="dot" id="dot"></span><span id="statusText">Loading</span></div>
+        <div class="hint" id="statusHint"></div>
+        <div class="progress" id="progressBar" hidden><div id="progress"></div></div>
+      </div>
+      <div class="msg warn" id="assetWarn" hidden></div>
+      <div class="panel">
+        <label class="toggle">Mute this phone <input type="checkbox" id="localMute"></label>
+        <div class="label" style="margin-top:10px">Volume</div>
+        <input type="range" id="volume" min="0" max="1" step="0.01" value="0.8" aria-label="Volume">
+        <p class="hint" style="margin:8px 0 0">This sets the app's level. Your phone's own volume buttons still apply.</p>
+      </div>
+      <p class="hint" id="wakeHint">Keep the screen on and this page open — phones pause pages in the background.</p>
+      <div class="actions"><button class="danger" id="leaveBtn">Leave</button></div>
+    </section>
+
+    <!-- ended -->
+    <section id="endStep" hidden>
+      <div class="status"><div class="big" id="endTitle">The story has ended</div><p class="hint" id="endHint">Thanks for being a speaker.</p></div>
+      <div class="actions"><a class="button secondary" href="/join">Join another story</a><a class="button secondary" href="/">Home</a></div>
+    </section>
+  </main>
+
+  <script type="module">
+    import { MemberSession } from "/room/member.js";
+    const $ = id => document.getElementById(id);
+    const ERRORS = {
+      invalid_code: "That code doesn't match an open story. Check it with the presenter.",
+      room_full: "This story already has as many speakers as it can take.",
+      room_locked: "The presenter has closed this story to new phones.",
+      rate_limited: "Too many tries. Wait a minute, then try again.",
+      bad_message: "Something went wrong joining. Please try again.",
+    };
+    const STATUS = {
+      joining: ["Joining…", ""],
+      enabling_sound: ["Sound is off", "Tap Enable sound to turn it back on."],
+      loading: ["Loading sounds", ""],
+      synchronizing: ["Synchronizing", "Lining this phone up with the others."],
+      ready: ["Ready", "This phone will play along with the story."],
+      muted: ["Paused by the presenter", "Sound comes back when they resume."],
+      reconnecting: ["Reconnecting…", "Lost the connection. Trying again — check you're on the right Wi-Fi."],
+    };
+    const ENDED = {
+      ended: ["The story has ended", "Thanks for being a speaker."],
+      removed: ["You were removed", "The presenter removed this phone from the story."],
+      expired: ["This story has ended", "The room closed while you were away."],
+      idle: ["This story has ended", "The room closed after a long pause."],
+      host_timeout: ["This story has ended", "The presenter didn't come back."],
+      server_restart: ["This story has ended", "The server restarted. Ask the presenter for a new code."],
+      left: ["You left the story", ""],
+    };
+    let wake = null;
+
+    const s = new MemberSession(render);
+    function render() {
+      const st = s.status;
+      const err = (s.error && ERRORS[s.error.code])
+        || (!s.joined && s.conn.attempt > 0 ? "Can't reach the story. Check you're on the same Wi-Fi as the presenter — still trying." : "")
+        || (s.error?.code === "audio" ? "This browser wouldn't start sound. Try again, or use Chrome / Safari." : "");
+      $("error").hidden = !err; $("error").textContent = err || "";
+      if (err) { $("joinBtn").disabled = !/^\d{6}$/.test($("code").value); }
+      $("codeStep").hidden = st !== "joining";
+      $("enableStep").hidden = !(s.joined && s.speaker.audioState !== "running" && st !== "ended" && !s.speaker.ctx);
+      $("liveStep").hidden = !(s.joined && s.speaker.ctx && st !== "ended");
+      $("endStep").hidden = st !== "ended";
+      if (st === "ended") {
+        const [t, h] = ENDED[s.endedReason] || ENDED.ended;
+        $("endTitle").textContent = t; $("endHint").textContent = h;
+        wake?.release?.(); wake = null;
+        return;
+      }
+      if (!$("liveStep").hidden) {
+        const [t, h] = STATUS[st] || [st, ""];
+        $("statusText").textContent = s.speaker.localMuted && st === "ready" ? "Ready (muted here)" : t;
+        $("statusHint").textContent = st === "loading" && s.progress.total ? `${s.progress.done} of ${s.progress.total}` : h;
+        $("dot").className = "dot" + (st === "ready" ? " ready" : st === "reconnecting" ? " bad" : "");
+        $("progressBar").hidden = st !== "loading";
+        $("progress").style.width = s.progress.total ? `${(100 * s.progress.done / s.progress.total).toFixed(0)}%` : "0";
+        $("assetWarn").hidden = !s.failed.length;
+        $("assetWarn").textContent = `${s.failed.length} sound${s.failed.length === 1 ? "" : "s"} didn't load on this phone — it will skip ${s.failed.length === 1 ? "it" : "them"}.`;
+        // sound got suspended (call, lock screen…): offer the tap again
+        if (st === "enabling_sound") { $("statusHint").innerHTML = ""; const b = document.createElement("button"); b.className = "primary"; b.textContent = "Enable sound"; b.onclick = enable; $("statusHint").append(b); }
+      }
+    }
+
+    // code input: digits only, paste-friendly, leading zeros kept (it's a string)
+    $("code").addEventListener("input", e => { e.target.value = e.target.value.replace(/\D/g, "").slice(0, 6); $("joinBtn").disabled = e.target.value.length !== 6; });
+    const fromLink = new URLSearchParams(location.search).get("code");
+    if (fromLink && /^\d{6}$/.test(fromLink)) { $("code").value = fromLink; $("joinBtn").disabled = false; }
+    $("codeStep").onsubmit = e => {
+      e.preventDefault();
+      const code = $("code").value;
+      if (!/^\d{6}$/.test(code)) return;
+      $("joinBtn").disabled = true;
+      s.join(code, $("name").value.trim());
+    };
+
+    async function enable() {
+      try { await s.enable(); } catch { s.error = { code: "audio", message: "" }; }
+      try { wake = await navigator.wakeLock?.request("screen"); $("wakeHint").textContent = "Keep this page open — the screen will stay on."; } catch { /* not supported: the hint stays */ }
+      render();
+    }
+    $("enableBtn").onclick = enable;
+    $("localMute").onchange = e => s.setLocalMute(e.target.checked);
+    $("volume").oninput = e => s.setVolume(Number(e.target.value));
+    $("leaveBtn").onclick = () => { wake?.release?.(); s.leave(); };
+    document.addEventListener("visibilitychange", async () => { if (!document.hidden && wake?.released) { try { wake = await navigator.wakeLock.request("screen"); } catch { } } });
+
+    if (!s.resume()) render();   // a reload in the middle of a story rejoins with this tab's token
+  </script>
+</body>
+</html>

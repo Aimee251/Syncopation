@@ -8,14 +8,18 @@
     "mic": "tsx --env-file=.env predict.ts",
     "type": "tsx --env-file=.env predict.ts --type",
     "keys": "tsx --env-file=.env scripts/checkKeys.ts",
-    "mics": "tsx scripts/listMics.ts"
+    "mics": "tsx scripts/listMics.ts",
+    "room": "tsx --env-file-if-exists=.env scripts/roomServer.ts",
+    "test:room": "tsx --test tests/room.clock.test.ts tests/room.protocol.test.ts tests/room.rooms.test.ts tests/room.server.test.ts tests/room.talks.test.ts tests/room.mic.test.ts"
   },
   "dependencies": {
-    "@huggingface/transformers": "^3.0.0"
+    "@huggingface/transformers": "^3.0.0",
+    "ws": "^8.22.0"
   },
   "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.2",
     "tsx": "^4.19.0",
-    "typescript": "^5.5.0",
-    "@types/node": "^22.0.0"
+    "typescript": "^5.5.0"
   }
 }

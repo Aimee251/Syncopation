@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#ff6a1a">
+  <title>Syncopation</title>
+  <link rel="stylesheet" href="/room/style.css">
+</head>
+<body>
+  <main class="screen" id="screen">
+    <div class="brand">
+      <svg viewBox="0 0 140 196" aria-hidden="true"><path d="M38 2 L4 120 L76 192 L138 122 L104 36 L70 70 Z" fill="#000" stroke="#000" stroke-width="6" stroke-linejoin="round"/></svg>
+      <div class="wordmark">SYNCOPATION</div>
+    </div>
+    <div class="actions">
+      <button class="secondary" id="share">Share a story</button>
+      <button class="primary" id="tell">Tell a Story</button>
+      <p class="hint" id="tellNote" hidden>For now, telling a story runs on the presenter's laptop: <code>npm run dev -- --room</code>.</p>
+    </div>
+    <div class="sheet-backdrop" id="backdrop"></div>
+    <section class="sheet" role="dialog" aria-label="Share a story">
+      <h2>Share a story</h2>
+      <p class="hint">Phones in the room play the soundtrack together.</p>
+      <a class="button primary" href="/host">Become host</a>
+      <a class="button secondary" href="/join">Join a story</a>
+    </section>
+  </main>
+  <script>
+    const screen = document.getElementById("screen");
+    document.getElementById("share").onclick = () => screen.classList.add("open");
+    document.getElementById("backdrop").onclick = () => screen.classList.remove("open");
+    document.getElementById("tell").onclick = () => { document.getElementById("tellNote").hidden = false; };
+  </script>
+</body>
+</html>

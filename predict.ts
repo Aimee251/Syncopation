@@ -14,9 +14,10 @@ import * as readline from "node:readline";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { listen, setKeyterms } from "./stt"; // live voice → text lives in stt.ts
-import { playOnce, setLoop, setLevel, stopAll, duck, playerName, startMixer, waitForBrowser, preload, pickCompatible, setMixLogger, soundProfile } from "./mixer"; // browser mixer with afplay fallback (player.ts)
+import { playOnce, setLoop, setLevel, stopAll, duck, playerName, startMixer, startRoom, waitForBrowser, preload, pickCompatible, setMixLogger, soundProfile } from "./mixer"; // browser mixer with afplay fallback (player.ts)
 import { expandLibrary, finishLibrary } from "./scripts/buildLibrary"; // extra scraping rounds while the talk is running
 import { providerStatus } from "./convex/lib/pipeline";
+import { inTalkChild } from "./room/talkBridge";
 
 // =====================================================================
 // 1. TALK + SOUND LIBRARY
@@ -1340,8 +1341,14 @@ async function main() {
   console.table(Object.fromEntries(ARCS.map(a => [a, { ...PLAN[a], sounds: budget(a) }])));
   process.on("SIGINT", endTalk);
   console.log(existsSync(WEIGHTS_FILE) ? `Loaded learned weights from ${WEIGHTS_FILE}` : "Starting with default weights (they'll be saved to weights.json at /end)");
-  // --web: sound goes to the browser mixer (crossfades, ducking, smooth levels); otherwise afplay plays from the terminal
-  if (process.argv.includes("--web")) {
+  // --room: phones join a speaker room and play every sound together; the talk waits until the host presses Start
+  if (process.argv.includes("--room")) {
+    const room = await startRoom(LIBRARY.flatMap(s => s.files ?? []), m => say(C.music, "ROOM", m));
+    console.log(`\nSpeaker room: on a phone on this Wi-Fi open ${room.urls[0]}\n  Share a story → Become host, then Start the talk when the phones are Ready.`);
+    await room.engine.started;
+    console.log("Host pressed Start — starting the talk.\n");
+  } else if (process.argv.includes("--web")) {
+    // --web: sound goes to the browser mixer (crossfades, ducking, smooth levels); otherwise afplay plays from the terminal
     try {
       const url = await startMixer();
       console.log(`\nBrowser mixer: ${url}  (opening it — click "Start" there to enable audio)`);
@@ -1375,6 +1382,17 @@ async function main() {
       : handleQueued;
     queued.splice(0).forEach(onLine); // anything typed while the plan was loading
     rl.on("close", () => { chain.then(() => setTimeout(printTimeline, 1500)); });
+    // run by the room server: the host phone's microphone arrives as words over IPC (room/mic.ts), streaming like the
+    // local mic does; the server gets the trigger words for its speech model, as setKeyterms would get them below
+    if (inTalkChild()) {
+      process.send!({ op: "keyterms", terms: [...CUES.flatMap(s => [...(s.instant ?? []), ...s.tags]), ...STORY.keywords].filter(t => t.split(/\s+/).length <= 3) });
+      process.on("message", (m: any) => {
+        if (typeof m?.text !== "string" || !m.text.trim()) return;
+        const text = m.text.replace(/^\s*\/+/, ""); // spoken words are never commands
+        if (m.op === "partial") handlePartial(text, Number(m.lagMs) || 0).catch(() => { });
+        else if (m.op === "final") handleQueued(text);
+      });
+    }
     return;
   }
 
