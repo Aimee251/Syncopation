@@ -7,7 +7,7 @@ export type Density = "subtle" | "normal" | "expressive";
 /** Speculative sounds may fire on a prediction alone; committed ones only after a trigger word. */
 export type Safety = "speculative" | "committed";
 
-export type SourceName = "freesound" | "apify" | "elevenlabs" | "cartesia";
+export type SourceName = "freesound" | "apify" | "elevenlabs" | "cartesia" | "local";
 
 /** What the user set on the Setup screen (spec: User flow, steps 1–5). */
 export interface SetupInput {

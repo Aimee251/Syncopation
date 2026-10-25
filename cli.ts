@@ -84,7 +84,8 @@ async function setup(): Promise<{ dir: string; meta: any }> {
   const id = `${themeIn.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "").slice(0, 24) || "talk"}_${new Date().toISOString().slice(5, 16).replace(/[-:T]/g, "")}`;
   const dir = join(SESSIONS, id);
   mkdirSync(dir, { recursive: true });
-  const generate = "sfx" as const;
+  // ElevenLabs only fills gaps the search couldn't: "sfx" generated an extra variant of EVERY effect and used up the credits
+  const generate = "fallback" as const;
   // progress is held back while questions are on screen (it would scribble over the prompt), then shown
   let showProgress = false, lastProgress = "";
   const progress = (e: { completed: number; total: number; message: string }) => {
@@ -165,6 +166,13 @@ async function main() {
   console.log(dim("   Start talking when you hear the music. Ctrl+C or /end to finish.\n"));
   rl.close();
   const mode = typeMode ? "type" : "mic";
+  // pick any microphone: npm run dev -- --mic "Shure MV7"   (names: npm run mics), or MIC_DEVICE=... in .env
+  const micArg = flagVal("mic", "");
+  if (mode === "mic" && micArg) {
+    process.env.MIC_DEVICE = micArg;
+    const ok = spawnSync("sox", ["-q", "-t", "coreaudio", micArg, "-n", "trim", "0", "0.1"], { stdio: "ignore" }).status === 0;
+    console.log(ok ? dim(`   Mic: ${micArg}`) : `   ⚠ couldn't open the mic "${micArg}" — check the exact name with: npm run mics`);
+  } else if (mode === "mic" && process.env.MIC_DEVICE) console.log(dim(`   Mic: ${process.env.MIC_DEVICE} (from .env)`));
   if (mode === "mic" && process.platform === "darwin" && !process.env.MIC_DEVICE) {
     // AirPods as the mic force the low-quality call profile and can silence playback → use the laptop mic.
     const probe = spawnSync("sox", ["-q", "-t", "coreaudio", "MacBook Pro Microphone", "-n", "trim", "0", "0.1"], { stdio: "ignore" });
@@ -175,7 +183,7 @@ async function main() {
   }
 
   const args = ["tsx", "--env-file=.env", "predict.ts", "--library", join(dir, "library.json"), "--setup", join(dir, "setup.json"),
-    ...passthrough.filter((a, i) => a !== "--type" && a !== "--no-web" && a !== "--web" && a !== "--first-batch" && passthrough[i - 1] !== "--first-batch"), ...(mode === "type" ? ["--type"] : []), ...(web ? ["--web"] : [])];
+    ...passthrough.filter((a, i) => !["--type", "--no-web", "--web", "--first-batch", "--mic"].includes(a) && !["--first-batch", "--mic"].includes(passthrough[i - 1])), ...(mode === "type" ? ["--type"] : []), ...(web ? ["--web"] : [])];
   const child = spawn("npx", args, { stdio: "inherit" });
   child.on("exit", code => process.exit(code ?? 0));
   process.on("SIGINT", () => { /* forwarded to the child through the shared terminal */ });

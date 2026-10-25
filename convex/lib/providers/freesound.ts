@@ -18,7 +18,25 @@ export interface FreesoundOpts {
   pageSize?: number;
 }
 
+// PACING: Freesound allows ~60 requests/minute per key. Bursts (24 searches at once) tripped the limit within seconds and the
+// sounds behind them went missing. Searches now take a token from a bucket (8 at once, refilled at 50/min) and wait their
+// turn instead — slower by a second or two in a burst, but nothing is refused.
+// a burst of 14 lets the whole first batch search at once (no waiting at startup); refilled at 45/min → never over 60/min
+const BUCKET = { tokens: 14, max: 14, perMs: 60_000 / 45, last: Date.now() };
+async function takeToken() {
+  for (;;) {
+    const now = Date.now();
+    BUCKET.tokens = Math.min(BUCKET.max, BUCKET.tokens + (now - BUCKET.last) / BUCKET.perMs);
+    BUCKET.last = now;
+    if (BUCKET.tokens >= 1) { BUCKET.tokens -= 1; return; }
+    await new Promise((r) => setTimeout(r, Math.ceil((1 - BUCKET.tokens) * BUCKET.perMs)));
+  }
+}
+export const freesoundRequests = { count: 0 };
+
 export async function searchFreesound(query: string, opts: FreesoundOpts, token: string): Promise<Candidate[]> {
+  await takeToken();
+  freesoundRequests.count++;
   const filter = [
     `duration:[${opts.minDurationS} TO ${opts.maxDurationS}]`,
     LICENSE_FILTER,

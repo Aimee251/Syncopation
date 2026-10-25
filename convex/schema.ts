@@ -18,7 +18,7 @@ export const soundFields = {
   safety: v.union(v.literal("speculative"), v.literal("committed")),
   durationMs: v.number(),
   loop: v.boolean(),
-  source: v.union(v.literal("freesound"), v.literal("apify"), v.literal("elevenlabs"), v.literal("cartesia")),
+  source: v.union(v.literal("freesound"), v.literal("apify"), v.literal("elevenlabs"), v.literal("cartesia"), v.literal("local")),
   sourceId: v.string(),
   license: v.string(),
   attribution: v.optional(v.string()),

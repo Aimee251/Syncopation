@@ -2,7 +2,20 @@
   "name": "syncopation-predict",
   "private": true,
   "type": "module",
-  "scripts": { "dev": "tsx --env-file=.env cli.ts", "start": "tsx --env-file=.env cli.ts", "mic": "tsx --env-file=.env predict.ts", "type": "tsx --env-file=.env predict.ts --type" },
-  "dependencies": { "@huggingface/transformers": "^3.0.0" },
-  "devDependencies": { "tsx": "^4.19.0", "typescript": "^5.5.0", "@types/node": "^22.0.0" }
+  "scripts": {
+    "dev": "tsx --env-file=.env cli.ts",
+    "start": "tsx --env-file=.env cli.ts",
+    "mic": "tsx --env-file=.env predict.ts",
+    "type": "tsx --env-file=.env predict.ts --type",
+    "keys": "tsx --env-file=.env scripts/checkKeys.ts",
+    "mics": "tsx scripts/listMics.ts"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.0.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0",
+    "@types/node": "^22.0.0"
+  }
 }
