@@ -225,6 +225,13 @@ export default function Home() {
         <Grid />
       </div>
 
+      {/* The prompt blurs into focus on the home screen and back out as soon as the button is pressed. */}
+      <p className={`prompt ${stage === 'home' && !holding && !flying && !bubble ? '' : 'hidden'}`}>
+        What’s Your
+        <br />
+        Story About?
+      </p>
+
       {/* The glow on its way up; drawn under the button so it emerges from behind it. */}
       <div ref={orbRef} className="orb" aria-hidden="true" />
 
