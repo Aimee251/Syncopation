@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
+import Fire from './Fire.jsx';
 import Grid from './Grid.jsx';
+import Strike from './Strike.jsx';
 import PageTurn from './PageTurn.jsx';
 import WaveGradient from './WaveGradient.jsx';
 import Wheel from './Wheel.jsx';
@@ -42,6 +44,9 @@ const SHRINK_MS = 1200;
 // The pages, in mockup px: the background scales down to exactly this.
 const PAGES = { w: 344, h: 747 };
 
+// "Tell a Story" morphing into the black button; matches .start in styles.css.
+const INTRO_OUT_MS = 1000;
+
 const NOTHING_HEARD = listenSupported
   ? "Didn't catch that. Hold and speak."
   : "This browser can't listen. Try Safari or Chrome.";
@@ -50,10 +55,11 @@ export default function Home() {
   const [holding, setHolding] = useState(false);
   const [flying, setFlying] = useState(false);
   const [bubble, setBubble] = useState(null);
+  // 'intro' (the fire and "Tell a Story") → 'introOut' (the button morphs into the black one) →
   // 'home' (hold to speak) → 'wheel' (turn it to the arrow) → 'launch' (the ring undraws) →
   // 'shrink' (the background scales down into the pages) → 'turning' (the page-turn loop),
   // then 'closing' on the way back to home.
-  const [stage, setStage] = useState('home');
+  const [stage, setStage] = useState('intro');
   // The wheel's line has reached the arrow.
   const [done, setDone] = useState(false);
   const sceneRef = useRef(null);
@@ -75,6 +81,12 @@ export default function Home() {
     const id = setInterval(() => setSeconds(Math.floor((Date.now() - start) / 1000)), 250);
     return () => clearInterval(id);
   }, [stage]);
+
+  // "Tell a Story": the fire and title blur away while the button becomes the black hold button.
+  const startStory = () => {
+    setStage('introOut');
+    setTimeout(() => setStage('home'), INTRO_OUT_MS);
+  };
 
   const press = (e) => {
     e.currentTarget.setPointerCapture?.(e.pointerId);
@@ -226,11 +238,13 @@ export default function Home() {
       </div>
 
       {/* The prompt blurs into focus on the home screen and back out as soon as the button is pressed. */}
-      <p className={`prompt ${stage === 'home' && !holding && !flying && !bubble ? '' : 'hidden'}`}>
-        What’s Your
-        <br />
-        Story About?
-      </p>
+      {stage !== 'intro' && stage !== 'introOut' && (
+        <p className={`prompt ${stage === 'home' && !holding && !flying && !bubble ? '' : 'hidden'}`}>
+          What’s Your
+          <br />
+          Story About?
+        </p>
+      )}
 
       {/* The glow on its way up; drawn under the button so it emerges from behind it. */}
       <div ref={orbRef} className="orb" aria-hidden="true" />
@@ -264,6 +278,18 @@ export default function Home() {
           <span className="dot" />
         </button>
       </div>
+
+      {/* The opening screen. Its button sits over the hold button and morphs down into it. */}
+      {(stage === 'intro' || stage === 'introOut') && (
+        <div className="intro">
+          <Strike className="strike" />
+          <Fire className="fire" />
+          <p className="title">SYNCOPATION</p>
+          <button className="start" onClick={startStory} disabled={stage !== 'intro'}>
+            <span>Tell a Story</span>
+          </button>
+        </div>
+      )}
 
       {(stage === 'wheel' || stage === 'launch') && (
         <Wheel done={done} leaving={stage === 'launch'} onProgress={setProgress} onDone={finishWheel} />

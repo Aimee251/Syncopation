@@ -589,3 +589,129 @@ body,
   .wipe-blur { display: none; }
   .wheel-arrow { animation: none; }
 }
+
+/* ---------- Opening screen: the fire, the name, "Tell a Story" ---------- */
+
+/* The strike of fire down the middle, behind the logo; Strike.jsx draws it small, this softens it. */
+.strike {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  filter: blur(calc(26 * var(--u)));
+  animation: intro-in 1200ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+/* The fire's frames all rise from the same bottom point, so they're anchored there (y=512 on the mockup). */
+.fire {
+  position: absolute;
+  left: 50%;
+  top: calc(50% + (512 - 437) * var(--u));
+  width: calc(174 * var(--u));
+  height: calc(270 * var(--u));
+  translate: -50% -100%;
+  pointer-events: none;
+  animation: intro-in 900ms 150ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+.fire img {
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  width: calc(174 * var(--u));
+  height: auto;
+  translate: -50% 0;
+  user-select: none;
+}
+
+.title {
+  position: absolute;
+  left: 50%;
+  top: calc(50% + (549 - 437) * var(--u));
+  translate: -50% -50%;
+  margin: 0;
+  color: #1c1c1e;
+  font: 400 calc(18 * var(--u)) / 1 'SF Mono', ui-monospace, Menlo, monospace;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  animation: intro-in 900ms 350ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+@keyframes intro-in {
+  from { opacity: 0; scale: 0.96; filter: blur(calc(12 * var(--u))); }
+}
+@keyframes intro-out {
+  to { opacity: 0; scale: 0.96; filter: blur(calc(14 * var(--u))); }
+}
+.stage-introOut .strike,
+.stage-introOut .fire,
+.stage-introOut .title {
+  animation: intro-out 600ms ease-in both;
+}
+
+/* "Tell a Story": the same glowing coral pill as the speech bubble. */
+.start {
+  position: absolute;
+  left: 50%;
+  top: calc(50% + (797 - 437) * var(--u));
+  width: calc(283 * var(--u));
+  height: calc(62 * var(--u));
+  translate: -50% -50%;
+  padding: 0;
+  border: none;
+  border-radius: calc(31 * var(--u));
+  background: none;
+  isolation: isolate;
+  color: #fff;
+  font: 500 calc(19 * var(--u)) / 1 -apple-system, BlinkMacSystemFont, 'SF Pro Text', Inter, system-ui, sans-serif;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  animation: intro-in 900ms 550ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  /* For the morph into the black button. */
+  transition-property: top, width, height, border-radius;
+  transition-duration: 950ms;
+  transition-timing-function: cubic-bezier(0.45, 0, 0.2, 1);
+}
+.start:active { scale: 0.97; }
+.start::before,
+.start::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  transition: opacity 950ms cubic-bezier(0.45, 0, 0.2, 1);
+}
+.start::before {
+  background: #ff6739;
+  box-shadow: inset 0 0 calc(12 * var(--u)) calc(4 * var(--u)) rgb(255, 170, 50), 0 0 calc(8 * var(--u)) rgba(255, 130, 40, 0.5);
+  filter: blur(calc(2.5 * var(--u)));
+}
+/* The black it turns into. */
+.start::after {
+  background: #000;
+  opacity: 0;
+}
+.start span {
+  display: block;
+  transition: opacity 400ms ease, filter 400ms ease;
+}
+
+/* It slides down and narrows into the black hold button, landing exactly on top of it. */
+.stage-introOut .start {
+  top: calc(50% + 280 * var(--u));
+  width: calc(119 * var(--u));
+  height: calc(119 * var(--u));
+  border-radius: 50%;
+}
+.stage-introOut .start::before { opacity: 0; }
+.stage-introOut .start::after { opacity: 1; }
+.stage-introOut .start span {
+  opacity: 0;
+  filter: blur(calc(8 * var(--u)));
+}
+/* The real button is revealed underneath just as the morph lands. */
+.home.stage-introOut .hold-area {
+  opacity: 1;
+  transition: opacity 150ms 850ms;
+}
