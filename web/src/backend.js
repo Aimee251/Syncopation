@@ -29,8 +29,8 @@ const post = async (path, body) => {
 };
 
 /** The theme is in: planning and scraping start now. Resolves with the session id. */
-export const startSession = (theme) =>
-  post('start', { theme }).then((j) => j.id).catch(() => {
+export const startSession = (theme, room) =>
+  post('start', { theme, room }).then((j) => j.id).catch(() => {
     throw new Error(base || isLocal
       ? 'Backend not reachable. Is npm run app (and the tunnel) running on the laptop?'
       : 'No backend set. Open this page once with ?api=<your laptop tunnel URL>');
@@ -49,7 +49,23 @@ export async function whenReady(id, onProgress) {
 }
 
 /** Starts the live talk: the laptop's mic listens, sounds play from the laptop. */
-export const startTalk = (id, minutes) => post('talk', { id, minutes });
+export const startTalk = (id, minutes, room) => post('talk', { id, minutes, room });
 
 /** Ends the talk (the report is printed in the backend terminal). */
-export const stopTalk = () => post('stop', {}).catch(() => {});
+export const stopTalk = (room) => post('stop', { room }).catch(() => {});
+
+// ---- story rooms: one person creates a story and gets a code; others join with it and follow along ----
+
+/** Creates a room on the backend; resolves with its code (random, made by the server). */
+export const createRoom = () =>
+  post('room', {}).then((j) => j.code).catch(() => {
+    throw new Error(base || isLocal ? 'Backend not reachable. Is it running on the laptop?' : 'No backend set for this page.');
+  });
+
+/** A room's state: { state: 'waiting' | 'live' | 'ended', startedAt, serverNow }, or null if the code doesn't exist. */
+export async function getRoom(code) {
+  const r = await fetch(`${base}/api/room/${encodeURIComponent(code.trim().toUpperCase())}`, { headers });
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.json();
+}

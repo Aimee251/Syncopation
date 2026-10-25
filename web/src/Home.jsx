@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
+import Fire from './Fire.jsx';
 import Grid from './Grid.jsx';
 import PageTurn from './PageTurn.jsx';
 import WaveGradient from './WaveGradient.jsx';
+import Strike from './Strike.jsx';
 import Wheel from './Wheel.jsx';
 import { listenSupported, useListen } from './useListen.js';
-import { startSession, startTalk, stopTalk, whenReady } from './backend.js';
+import { createRoom, getRoom, startSession, startTalk, stopTalk, whenReady } from './backend.js';
 
 // Layout from the mockup, in its 402×874 px.
 const BUTTON = { x: 201, y: 717 };
@@ -46,6 +48,11 @@ const TALK_MINUTES = 3;
 // After an error, how long the message stays in the ring before going back home.
 const ERROR_MS = 3500;
 
+// "Create a Story" morphing into the black button; matches .start in styles.css.
+const INTRO_OUT_MS = 1000;
+// How often a listener asks the backend whether the story has started or ended.
+const POLL_MS = 1000;
+
 // The pages, in mockup px: the background scales down to exactly this.
 const PAGES = { w: 344, h: 747 };
 
@@ -53,14 +60,34 @@ const NOTHING_HEARD = listenSupported
   ? "Didn't catch that. Hold and speak."
   : "This browser can't listen. Try Safari or Chrome.";
 
+const INTRO_STAGES = ['intro', 'choose', 'code', 'introOut', 'join', 'waiting'];
+
 export default function Home() {
   const [holding, setHolding] = useState(false);
   const [flying, setFlying] = useState(false);
   const [bubble, setBubble] = useState(null);
-  // 'home' (hold to speak) → 'wheel' (turn it to the arrow) → 'launch' (the ring undraws) →
-  // 'shrink' (the background scales down into the pages) → 'turning' (the page-turn loop),
-  // then 'closing' on the way back to home.
-  const [stage, setStage] = useState('home');
+  // 'intro' (the fire and "Tell a Story") → 'choose' (create or join a story)
+  //   create: 'introOut' (the button morphs into the black one) → 'home' (hold to speak) → 'wheel' (turn it to the
+  //           arrow) → 'launch' (the ring undraws) → 'shrink' (the background scales down into the pages) →
+  //           'turning' (the page-turn loop, the talk), then 'closing' on the way back to home
+  //   join:   'join' (type the code) → 'waiting' (until the storyteller starts) → 'shrink' → 'turning' (same talk page)
+  const [stage, setStage] = useState('intro');
+  const stageRef = useRef(stage);
+  stageRef.current = stage;
+  // The story room: its code (made by the server), and whether this screen tells the story or listens to it.
+  const [room, setRoom] = useState('');
+  const [role, setRole] = useState(null); // 'host' | 'listener'
+  const [code, setCode] = useState('');
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+  // When the talk started, on this device's clock, so every screen in the room shows the same timer.
+  const liveSince = useRef(0);
+  const endedAt = useRef(0);
+  // A listener's waiting line: what the storyteller is doing right now (kept a few seconds after a story ends).
+  const waitingNote = (r) =>
+    Date.now() - endedAt.current < 6000 ? 'The story ended. Waiting for the next one…'
+      : r.phase === 'preparing' ? `Story: “${r.theme}”. Getting the sounds ready${r.total ? ` · ${r.done}/${r.total}` : '…'}`
+        : 'The storyteller is choosing a story…';
   // The wheel's line has reached the arrow.
   const [done, setDone] = useState(false);
   // The backend: the session being built from what was said, its progress line, and whether the talk has started.
@@ -81,11 +108,113 @@ export default function Home() {
 
   useEffect(() => {
     if (stage !== 'turning') return;
-    const start = Date.now();
+    const start = liveSince.current || Date.now();
     setSeconds(0);
     const id = setInterval(() => setSeconds(Math.floor((Date.now() - start) / 1000)), 250);
     return () => clearInterval(id);
   }, [stage]);
+
+  // LISTENERS follow the room: the talk page opens when the story starts and closes when it ends.
+  useEffect(() => {
+    if (role !== 'listener' || !room) return;
+    let stopped = false;
+    const tick = async () => {
+      let r;
+      try { r = await getRoom(room); } catch { return; } // a missed poll is retried next second
+      if (stopped) return;
+      const now = stageRef.current;
+      if (!r) { leaveRoom('That story has ended.'); return; }
+      // while waiting, show where the storyteller is: choosing a story, or the sounds for it loading
+      if (now === 'waiting' && r.state !== 'live') setNote(waitingNote(r));
+      if (r.state === 'live' && now === 'waiting') {
+        liveSince.current = Date.now() - Math.max(0, r.serverNow - r.startedAt);
+        setNote('');
+        shrink();
+        setTimeout(() => stageRef.current === 'shrink' && setStage('turning'), SHRINK_MS);
+      } else if (r.state !== 'live' && now === 'turning') {
+        closePages('waiting');
+        setNote('The story ended. Waiting for the next one…');
+        endedAt.current = Date.now();
+      }
+    };
+    tick();
+    const id = setInterval(tick, POLL_MS);
+    return () => { stopped = true; clearInterval(id); };
+  }, [role, room]);
+
+  // "Tell a Story" → choose: create a new story or join one with a code.
+  const chooseStory = () => { setNote(''); setStage('choose'); };
+
+  // CREATE: the backend makes the room and its code; then the button morphs into the hold button as before.
+  const createStory = async () => {
+    if (busy) return;
+    setBusy(true);
+    setNote('');
+    try {
+      const c = await createRoom();
+      setRoom(c);
+      setRole('host');
+      setStage('code'); // show the code big first, so it can be shared before the story starts
+      setNote('Share this code so others can join your story');
+    } catch (e) {
+      setNote(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // The code has been shared: "Start Telling" morphs into the hold button, as "Tell a Story" used to.
+  const startTelling = () => {
+    setNote('');
+    setStage('introOut');
+    setTimeout(() => setStage('home'), INTRO_OUT_MS);
+  };
+  const copyCode = () => {
+    navigator.clipboard?.writeText(room).then(() => setNote(`Copied ${room}. Share it so others can join`), () => {});
+  };
+
+  // JOIN: check the code with the backend, then wait for the storyteller to start.
+  const joinStory = async (e) => {
+    e?.preventDefault();
+    const c = code.trim().toUpperCase();
+    if (busy || c.length < 4) return;
+    setBusy(true);
+    setNote('');
+    try {
+      const r = await getRoom(c);
+      if (!r) { setNote('No story with that code. Check it and try again.'); return; }
+      setRoom(r.code);
+      setRole('listener');
+      setStage('waiting');
+      setNote(r.state === 'live' ? '' : waitingNote(r));
+    } catch {
+      setNote('Backend not reachable. Is it running on the laptop?');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // A listener leaves (or the room is gone): back to the opening screen.
+  const leaveRoom = (message = '') => {
+    setRole(null);
+    setRoom('');
+    setCode('');
+    if (stageRef.current === 'turning') closePages('intro');
+    else setStage('intro');
+    setNote(message);
+  };
+
+  // The talk page grows back out into the background, then `to` takes over.
+  const closePages = (to) => {
+    liveSince.current = 0;
+    setStage('closing');
+    sceneAnim.current?.reverse();
+    setTimeout(() => {
+      sceneAnim.current?.cancel();
+      sceneAnim.current = null;
+      setStage(to);
+    }, SHRINK_MS);
+  };
 
   const press = (e) => {
     e.currentTarget.setPointerCapture?.(e.pointerId);
@@ -131,7 +260,8 @@ export default function Home() {
       const id = await session.current;
       setLoadStatus('Planning your sounds…');
       await whenReady(id, (n, total) => total && setLoadStatus(`Gathering sounds · ${n}/${total}`));
-      await startTalk(id, TALK_MINUTES);
+      await startTalk(id, TALK_MINUTES, room);
+      liveSince.current = Date.now(); // the timer counts from the talk's start, same as on listeners' screens
     })();
     Promise.all([ready, minWait]).then(
       () => {
@@ -182,7 +312,9 @@ export default function Home() {
   // Tapping the page-turn screen grows the background back out and returns to the start.
   const reset = () => {
     if (stage !== 'turning') return;
-    stopTalk();
+    if (role === 'listener') return leaveRoom(); // a listener only leaves; the storyteller's talk goes on
+    stopTalk(room);
+    liveSince.current = 0;
     session.current = null;
     endRound();
     orbAnims.current.forEach((a) => a.cancel());
@@ -229,7 +361,7 @@ export default function Home() {
       r.heard = Boolean(text);
       // The theme is in: planning and fetching start now, while the wheel is being turned.
       if (r.heard) {
-        session.current = startSession(text);
+        session.current = startSession(text, room);
         session.current.catch(() => {}); // reported by the loader
       }
       if (!r.formed) return;
@@ -277,11 +409,13 @@ export default function Home() {
       </div>
 
       {/* The prompt blurs into focus on the home screen and back out as soon as the button is pressed. */}
-      <p className={`prompt ${stage === 'home' && !holding && !flying && !bubble ? '' : 'hidden'}`}>
-        What’s Your
-        <br />
-        Story About?
-      </p>
+      {!INTRO_STAGES.includes(stage) && (
+        <p className={`prompt ${stage === 'home' && !holding && !flying && !bubble ? '' : 'hidden'}`}>
+          What’s Your
+          <br />
+          Story About?
+        </p>
+      )}
 
       {/* The glow on its way up; drawn under the button so it emerges from behind it. */}
       <div ref={orbRef} className="orb" aria-hidden="true" />
@@ -315,6 +449,84 @@ export default function Home() {
           <span className="dot" />
         </button>
       </div>
+
+      {/* The opening screens: the fire and the name stay while you choose, type a code or wait. */}
+      {INTRO_STAGES.includes(stage) && (
+        <div className="intro">
+          <Strike className="strike" />
+          <Fire className="fire" />
+          <p className="title">SYNCOPATION</p>
+
+          {stage === 'intro' && (
+            <button key="tell" className="start" onClick={chooseStory}>
+              <span>Tell a Story</span>
+            </button>
+          )}
+
+          {(stage === 'code' || stage === 'introOut') && (
+            <>
+              <p className="code-label">YOUR STORY CODE</p>
+              <button key="mycode" className="start start-alt start-code" onClick={copyCode} disabled={stage !== 'code'} aria-label={`Story code ${room}, tap to copy`}>
+                <span>{room}</span>
+              </button>
+              {/* Sits where "Tell a Story" was, so it morphs into the hold button like before. */}
+              <button key="go" className="start" onClick={startTelling} disabled={stage !== 'code'}>
+                <span>Start Telling</span>
+              </button>
+            </>
+          )}
+
+          {stage === 'choose' && (
+            <>
+              <button key="join" className="start start-alt" onClick={() => { setNote(''); setStage('join'); }} disabled={busy}>
+                <span>Join a Story</span>
+              </button>
+              <button key="create" className="start" onClick={createStory} disabled={busy}>
+                <span>{busy ? 'Creating…' : 'Create a Story'}</span>
+              </button>
+            </>
+          )}
+
+          {stage === 'join' && (
+            <form key="code" className="start code-form" onSubmit={joinStory}>
+              <input
+                className="code-input"
+                value={code}
+                onChange={(e) => setCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 4))}
+                placeholder="Enter code"
+                inputMode="text"
+                autoCapitalize="characters"
+                autoComplete="off"
+                autoCorrect="off"
+                spellCheck="false"
+                aria-label="Story code"
+                autoFocus
+              />
+              <button className="code-go" type="submit" disabled={busy || code.length < 4} aria-label="Join">
+                →
+              </button>
+            </form>
+          )}
+
+          {stage === 'waiting' && (
+            <p key="wait" className="start start-static">
+              <span>Story {room}</span>
+            </p>
+          )}
+
+          {note && <p className="intro-note" role="status">{note}</p>}
+          {(stage === 'choose' || stage === 'join' || stage === 'waiting') && (
+            <button className="intro-back" onClick={() => (stage === 'waiting' ? leaveRoom() : stage === 'join' ? setStage('choose') : setStage('intro'))}>
+              {stage === 'waiting' ? 'Leave' : 'Back'}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* The storyteller's code, so others can join; shown until the story is told. */}
+      {role === 'host' && room && !INTRO_STAGES.includes(stage) && (
+        <p className="room-code" aria-label={`Story code ${room}`}>STORY {room}</p>
+      )}
 
       {(stage === 'wheel' || stage === 'launch') && (
         <Wheel

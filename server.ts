@@ -11,6 +11,7 @@
 //   4. tap the page → POST /api/stop: sends /end (report printed here, learned weights saved)
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { randomInt } from "node:crypto";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { extname, join, resolve } from "node:path";
@@ -94,6 +95,22 @@ const CORS = {
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, ngrok-skip-browser-warning",
 };
+// STORY ROOMS: the storyteller creates a room and gets a random code; listeners join with it and follow the same talk
+// (they land on the talk page when it starts, with the same timer). One laptop runs one talk at a time.
+type Room = { code: string; state: "waiting" | "live" | "ended"; startedAt: number; theme: string; jobId: string; touched: number };
+const rooms = new Map<string, Room>();
+const CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // no 0/O, 1/I/L: easy to read out loud and type
+function newRoom(): Room {
+  for (const [c, r] of rooms) if (Date.now() - r.touched > 6 * 3600_000) rooms.delete(c); // forget rooms idle for 6 h
+  let code = "";
+  do code = Array.from({ length: 4 }, () => CODE_CHARS[randomInt(CODE_CHARS.length)]).join(""); while (rooms.has(code));
+  const room: Room = { code, state: "waiting", startedAt: 0, theme: "", jobId: "", touched: Date.now() };
+  rooms.set(code, room);
+  console.log(`[app] room ${code} created`);
+  return room;
+}
+const roomOf = (code: unknown) => rooms.get(String(code ?? "").trim().toUpperCase());
+
 const send = (res: ServerResponse, code: number, body: unknown) => {
   res.writeHead(code, { "Content-Type": "application/json", ...CORS });
   res.end(JSON.stringify(body));
@@ -109,9 +126,12 @@ createServer(async (req, res) => {
   if (req.method === "OPTIONS") { res.writeHead(204, CORS); return res.end(); }
   try {
     if (req.method === "POST" && url.pathname === "/api/start") {
-      const { theme } = await readBody(req);
+      const { theme, room: code } = await readBody(req);
       if (!String(theme ?? "").trim()) return send(res, 400, { error: "no theme" });
-      return send(res, 200, { id: startJob(String(theme).trim()).id });
+      const room = roomOf(code);
+      const job = startJob(String(theme).trim());
+      if (room) Object.assign(room, { theme: job.theme, jobId: job.id, touched: Date.now(), state: room.state === "live" ? "live" : "waiting" });
+      return send(res, 200, { id: job.id });
     }
     if (req.method === "GET" && url.pathname === "/api/status") {
       const job = jobs.get(url.searchParams.get("id") || "");
@@ -119,15 +139,33 @@ createServer(async (req, res) => {
       return send(res, 200, { state: job.state, done: job.done, total: job.total, error: job.error, seconds: Math.round((Date.now() - job.t0) / 1000) });
     }
     if (req.method === "POST" && url.pathname === "/api/talk") {
-      const { id, minutes } = await readBody(req);
+      const { id, minutes, room: code } = await readBody(req);
       const job = jobs.get(id);
       if (!job || job.state !== "ready") return send(res, 409, { error: "library not ready" });
       startTalk(job, Number(minutes) || 3);
+      // this laptop runs one talk: any other live room has ended; this one is live from now
+      for (const r of rooms.values()) if (r.state === "live") r.state = "ended";
+      const room = roomOf(code);
+      if (room) Object.assign(room, { state: "live", startedAt: Date.now(), touched: Date.now() });
       return send(res, 200, { ok: true });
     }
     if (req.method === "POST" && url.pathname === "/api/stop") {
+      const { room: code } = await readBody(req);
       stopTalk();
+      const room = roomOf(code);
+      if (room) Object.assign(room, { state: "ended", touched: Date.now() });
       return send(res, 200, { ok: true });
+    }
+    if (req.method === "POST" && url.pathname === "/api/room") return send(res, 200, { code: newRoom().code });
+    if (req.method === "GET" && url.pathname.startsWith("/api/room/")) {
+      const room = roomOf(decodeURIComponent(url.pathname.slice("/api/room/".length)));
+      if (!room) return send(res, 404, { error: "no story with that code" });
+      room.touched = Date.now();
+      // what listeners see while they wait: the storyteller is still choosing, or the sounds for their theme are loading
+      const job = jobs.get(room.jobId);
+      const phase = room.state !== "waiting" ? room.state : !job ? "choosing" : "preparing";
+      return send(res, 200, { code: room.code, state: room.state, phase, startedAt: room.startedAt, theme: room.theme,
+        done: job?.done ?? 0, total: job?.total ?? 0, serverNow: Date.now() });
     }
     // --share: this server also serves the built web page, so ONE address (port 8787) has page + API → one tunnel
     if (SHARE && req.method === "GET" && !url.pathname.startsWith("/api/")) return serveWeb(url.pathname, res);
