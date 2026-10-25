@@ -12,13 +12,23 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { extname, join, resolve } from "node:path";
 import { buildSoundLibrary, startPlans } from "./scripts/buildLibrary";
 import { DEFAULT_OPTS, resetProviderHealth } from "./convex/lib/pipeline";
 import type { SetupInput } from "./convex/lib/types";
 
 const PORT = Number(process.env.PORT || 8787);
+const SHARE = process.argv.includes("--share");
+const TYPES: Record<string, string> = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".webp": "image/webp", ".png": "image/png", ".svg": "image/svg+xml", ".json": "application/json", ".ico": "image/x-icon" };
+function serveWeb(pathname: string, res: ServerResponse) {
+  const root = resolve("web/dist");
+  let file = resolve(root, "." + decodeURIComponent(pathname));
+  if (!file.startsWith(root) || !existsSync(file) || statSync(file).isDirectory()) file = join(root, "index.html"); // the app's own pages
+  if (!existsSync(file)) { res.writeHead(503); return res.end("web page not built yet"); }
+  res.writeHead(200, { "Content-Type": TYPES[extname(file)] ?? "application/octet-stream" });
+  res.end(readFileSync(file));
+}
 const FIRST_BATCH = 8; // concrete events the speaker is likely to name early (planner.ts) + 1 ambience
 const layers = { music: true, sfx: true, voice: false };
 
@@ -78,8 +88,14 @@ function stopTalk() {
   setTimeout(() => child.kill("SIGINT"), 5000).unref();
 }
 
+// the deployed page (Vercel) calls this server through a tunnel from another site: allow that (no cookies, no secrets in replies)
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, ngrok-skip-browser-warning",
+};
 const send = (res: ServerResponse, code: number, body: unknown) => {
-  res.writeHead(code, { "Content-Type": "application/json" });
+  res.writeHead(code, { "Content-Type": "application/json", ...CORS });
   res.end(JSON.stringify(body));
 };
 const readBody = (req: IncomingMessage) => new Promise<any>(resolve => {
@@ -90,6 +106,7 @@ const readBody = (req: IncomingMessage) => new Promise<any>(resolve => {
 
 createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://x");
+  if (req.method === "OPTIONS") { res.writeHead(204, CORS); return res.end(); }
   try {
     if (req.method === "POST" && url.pathname === "/api/start") {
       const { theme } = await readBody(req);
@@ -112,6 +129,8 @@ createServer(async (req, res) => {
       stopTalk();
       return send(res, 200, { ok: true });
     }
+    // --share: this server also serves the built web page, so ONE address (port 8787) has page + API → one tunnel
+    if (SHARE && req.method === "GET" && !url.pathname.startsWith("/api/")) return serveWeb(url.pathname, res);
     send(res, 404, { error: "not found" });
   } catch (e) {
     send(res, 500, { error: e instanceof Error ? e.message : String(e) });
@@ -120,7 +139,14 @@ createServer(async (req, res) => {
 
 // the web app (Vite) in the same terminal; /api is proxied to this server (web/vite.config.js)
 let web: ChildProcess | null = null;
-if (!process.argv.includes("--no-web") && existsSync("web/package.json")) {
+if (SHARE) {
+  // build the page once (vite build → web/dist); it's then served by this server at http://127.0.0.1:8787
+  if (!existsSync("web/node_modules")) spawnSync("npm", ["--prefix", "web", "install"], { stdio: "inherit" });
+  const b = spawnSync("npm", ["--prefix", "web", "run", "build"], { stdio: "inherit" });
+  console.log(b.status === 0
+    ? `\n[app] web page + backend on http://127.0.0.1:${PORT}\n[app] share it:  cloudflared tunnel --url http://127.0.0.1:${PORT}\n`
+    : "[app] web page build failed (see above)");
+} else if (!process.argv.includes("--no-web") && existsSync("web/package.json")) {
   if (!existsSync("web/node_modules")) spawnSync("npm", ["--prefix", "web", "install"], { stdio: "inherit" });
   web = spawn("npm", ["--prefix", "web", "run", process.argv.includes("--phone") ? "dev:phone" : "dev"], { stdio: "inherit" });
 }
