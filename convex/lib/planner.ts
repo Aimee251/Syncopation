@@ -5,7 +5,7 @@
 import type { LibraryPlan, MusicSlot, SetupInput, SfxSlot, VoiceSlot } from "./types";
 
 const SFX_MAX_S = 1.5; // spec: keep SFX under 1.5 s
-const MAX_SFX_SLOTS = 12;
+const MAX_SFX_SLOTS = 30;
 const MAX_VOICE_SLOTS = 4;
 
 /** Speculative sounds every library gets (spec: "Prevent" table). */
@@ -22,12 +22,34 @@ const words = (s: string) => s.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w
 
 // ---------------------------------------------------------------- Claude call
 
+// The description typed before the talk is a PRIOR, not a script. No genre or topic is assumed here: the model infers tone and
+// setting from the words it is given, and stays broad when they are vague (the live director narrows it down from the speech).
+const GROUNDING =
+  "THE DESCRIPTION IS A PRIOR, NOT A SCRIPT. Infer the setting, tone and genre only from what it actually says; do not add plot elements, a genre or a music style that none of its words support. " +
+  "When it is short or vague, plan broadly useful sounds for the place and mood it does imply (ambience plus versatile effects) instead of committing to one imagined storyline: the live speech will decide the specifics. " +
+  "Music moods are emotional feelings, not genres or settings.";
+
+// LIVE DIRECTOR: during the talk each round is a decision, not a plan. The model sees the pre-talk prior, what was actually said,
+// the library and what is playing, and picks the best action (often: add nothing).
+const LIVE_DIRECTOR = [
+  "You are the live sound director of Syncopation, an app that enhances a real, unscripted speech with music, ambience and sound effects.",
+  "Before the talk a library was planned from a short description: that is only a PRIOR. Now the speaker is talking and the message gives you the evidence: what was just said, what is already in the library (and what was played), what is playing right now, and the pre-talk plan.",
+  "Decide the best action from the evidence, whatever the topic or genre turns out to be:",
+  "- If the library already covers what these words and the next few moments need, return an EMPTY sfx array. Adding nothing is often the right answer.",
+  "- Otherwise return only the sounds that are MISSING: sounds the words name or imply, and sounds likely soon in the story AS TOLD. Weigh the prior and the speech as evidence: when they disagree, the speech wins; when the speech is ordinary, plan ordinary sounds whatever the prior suggested; when they agree, use the prior's sounds.",
+  "- Add an ambience bed (id ending _ambience) only when the place changed or no existing bed fits where the speaker is.",
+  "- Fill every metadata field so the sound MESHES with what is playing now: intensity, softness, emphasis, length_s, attack, tail. A sound that must sit inside the music and ambience is soft with a gentle attack and a longer tail; a hit that should cut through is sharp with an instant attack and a short tail; a pivotal moment gets high emphasis, a passing detail low.",
+  "- instant = phrases the speaker says when the sound is HAPPENING (never a bare noun or place). Queries are for Freesound text search: concrete nouns + verbs. Return at most 6 sounds, an empty music array and an empty voice array.",
+  "- Put one line in `read`: what the speech is actually about, how well the library fits it, and why you added what you added.",
+].join("\n");
+
 const PLAN_TOOL = {
   name: "plan_library",
   description: "Plan the sound library for a live talk.",
   input_schema: {
     type: "object",
     properties: {
+      read: { type: "string", description: "LIVE ROUNDS ONLY: one line on what the speech is actually about, how well the library fits it, and why these sounds were added (or none)" },
       sfx: {
         type: "array",
         maxItems: MAX_SFX_SLOTS,
@@ -39,10 +61,17 @@ const PLAN_TOOL = {
             queries: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 3, description: "2–4 word sound-library search phrases, best first" },
             gen_prompt: { type: "string", description: "One-sentence prompt for a text-to-SFX model" },
             safety: { type: "string", enum: ["speculative", "committed"], description: "speculative = risers, swells, drones, ambience that can fade out harmlessly; committed = discrete events (hits, creaks, knocks) that only make sense after their trigger word" },
-            intensity: { type: "number", minimum: 0, maximum: 1 },
+            intensity: { type: "number", minimum: 0, maximum: 1, description: "how intense / energetic the sound itself is (a whisper-quiet creak 0.1, a crash 0.9)" },
             tags: { type: "array", items: { type: "string" }, maxItems: 8 },
+            instant: { type: "array", items: { type: "string" }, maxItems: 4, description: "phrases a speaker says when this sound is actually HAPPENING (verb or event, e.g. 'barks', 'doorbell rings'); never a bare noun or place" },
+            emphasis: { type: "number", minimum: 0, maximum: 1, description: "STORY WEIGHT of this event, not loudness: 0-0.3 incidental detail, 0.4-0.6 supporting moment, 0.7-1 a pivotal event the story turns on. The live mixer decides from the scene whether to soften or lift it." },
+            softness: { type: "number", minimum: 0, maximum: 1, description: "the sound's own character: 0 = sharp, harsh transient (crash, bang, buzzer), 0.5 = ordinary, 1 = gentle and diffuse (rustle, murmur, pour, soft footsteps)" },
+            length_s: { type: "number", minimum: 0.3, maximum: 4, description: "how long this sound should last in seconds: a click or knock 0.3-0.6, a door slam or ring 1-1.5, a swell, riser or rolling thunder 2-4" },
+            attack: { type: "number", minimum: 0, maximum: 1, description: "how it starts: 0 = instant onset (hit, click), 0.5 = quick build, 1 = slow swell in" },
+            tail: { type: "number", minimum: 0, maximum: 1, description: "how it ends: 0 = clean cut (knock, click), 0.5 = natural decay, 1 = long lingering fade (rumble, chime, wash)" },
+            event: { type: "string", description: "one short line: the event this sound represents" },
           },
-          required: ["id", "label", "queries", "gen_prompt", "safety", "intensity", "tags"],
+          required: ["id", "label", "queries", "gen_prompt", "safety", "intensity", "tags", "instant", "emphasis", "softness", "length_s", "attack", "tail", "event"],
         },
       },
       music: {
@@ -75,17 +104,35 @@ const PLAN_TOOL = {
       },
     },
     required: ["sfx", "music", "voice"],
+    // `read` is optional: only the live director fills it
   },
 } as const;
 
-function systemPrompt(input: SetupInput): string {
+function systemPrompt(input: SetupInput, fast = 0): string {
+  if (input.live) return LIVE_DIRECTOR;
+  if (fast) return [
+    "You plan the OPENING of a small sound library for Syncopation, which adds music and sound effects under a live speaker.",
+    GROUNDING,
+    `Theme: ${input.theme}. Return exactly 2 music moods that fit (lowest intensity first; the first opens the talk) and exactly ${fast} SFX slots:`,
+    "the sounds most likely needed in the first 30 seconds, most likely first, plus one ambience bed (id containing 'ambience').",
+    "Every SFX has its own planned length (length_s, usually 0.3-2 s; up to 4 s only for a swell, riser or long event) except the ambience bed. Fill intensity, softness, length_s, attack and tail for each sound: they decide how it is searched, trimmed and faded in the mix. Queries are for Freesound text search: concrete nouns + verbs, no adjectives like 'scary'. Keep every field short.",
+    "Voice layer is off: return an empty voice array.",
+  ].join("\n");
   return [
     "You plan a small sound library for Syncopation, which adds music and sound effects under a live speaker.",
-    "Return only what the talk needs. Every SFX must be short (under 1.5 s) and must sit under a voice without distracting.",
-    `Theme: ${input.theme}. Music moods (return exactly one music entry per mood, in this order): ${input.moods.join(", ")}.`,
-    `Theme default SFX ids (include each): ${input.themeSfx.join(", ") || "none"}.`,
-    "Add one SFX slot per user keyword that names a sound; skip keywords that are not sounds (e.g. 'ghost' → whisper or eerie breath; 'house' → skip unless it implies a sound).",
+    GROUNDING,
+    "Return only what the talk needs. Every SFX is short and must sit under a voice without distracting: give each its own length_s (usually 0.3-2 s, up to 4 s only for a swell, riser or long event) and decide its intensity, softness, attack and tail yourself, from what the sound is and how the story would use it. Exception: background ambience or drone beds are long loops; give them an id containing 'ambience' or 'drone' (e.g. airport_ambience) so they are fetched as loops.",
+    input.moods.length
+      ? `Theme: ${input.theme}. Music moods (return exactly one music entry per mood, in this order): ${input.moods.join(", ")}.`
+      : `Theme: ${input.theme}. Choose 4-6 music moods that fit this theme and the talk, ordered from lowest to highest intensity, and return exactly one music entry per mood (mood = one or two words).`,
+    input.themeSfx.length ? `Theme default SFX ids (include each): ${input.themeSfx.join(", ")}.` : "",
+    "Add one SFX slot per user keyword that names a sound; skip keywords that are not sounds (an object or place only counts if it implies a sound).",
+    input.layers.music
+      ? "Also add SFX slots for sounds this kind of talk would plausibly need that the keywords miss (aim for 24-28 total), for ANY theme (comedy, nature, business, romance, sport...). Cover many situations the story could go through, with varied, concrete sounds: actions, objects, places, vehicles, weather, reactions, crowds."
+      : "This is a quick follow-up round during the talk: return at most 8 SFX slots, only for the moments described, none that are already in the library.",
+    input.layers.music ? "Include 2-3 speculative slots that fit the tone you infer (ambience beds, or gentle swells, drones or risers if they suit it) that can fade out harmlessly." : "",
     "Queries are for Freesound text search: concrete nouns + verbs, no adjectives like 'scary'.",
+    "ORDER MATTERS: list the SFX from most to least likely to be needed EARLY in the talk (the first 6 are fetched before the talk starts, the rest while it runs). List music moods from lowest to highest intensity; the first one opens the talk.",
     input.layers.voice
       ? "Voice layer is on: add up to 4 very short voice lines that fit the theme."
       : "Voice layer is off: return an empty voice array.",
@@ -96,7 +143,7 @@ function systemPrompt(input: SetupInput): string {
     .join("\n");
 }
 
-export async function planWithClaude(input: SetupInput, apiKey: string, model: string): Promise<LibraryPlan> {
+export async function planWithClaude(input: SetupInput, apiKey: string, model: string, fast = 0): Promise<LibraryPlan> {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -106,16 +153,15 @@ export async function planWithClaude(input: SetupInput, apiKey: string, model: s
     },
     body: JSON.stringify({
       model,
-      max_tokens: 2000,
-      system: systemPrompt(input),
+      max_tokens: fast ? 2500 : 8000,
+      system: systemPrompt(input, fast),
       tools: [PLAN_TOOL],
       tool_choice: { type: "tool", name: PLAN_TOOL.name },
       messages: [
         {
           role: "user",
-          content: `Talk description: ${input.prompt || "(none)"}\nKeywords: ${input.keywords.join(", ")}${
-            input.script ? `\nScript excerpt:\n${input.script.slice(0, 3000)}` : ""
-          }`,
+          content: `Talk description: ${input.prompt || "(none)"}\nKeywords: ${input.keywords.join(", ")}${input.script ? `\nScript excerpt:\n${input.script.slice(0, 3000)}` : ""
+            }`,
         },
       ],
     }),
@@ -124,11 +170,28 @@ export async function planWithClaude(input: SetupInput, apiKey: string, model: s
   const data = (await res.json()) as { content: Array<{ type: string; input?: any }> };
   const call = data.content.find((c) => c.type === "tool_use");
   if (!call?.input) throw new Error("Claude plan returned no tool call");
-  return normalizePlan(fromToolInput(call.input), input);
+  // live rounds never get the default speculative sounds: the director's answer (even an empty one) is final
+  const plan = normalizePlan(fromToolInput(call.input), input, false, !!fast || !!input.live);
+  if (input.live && typeof call.input.read === "string") plan.read = call.input.read;
+  return plan;
+}
+
+/** The model occasionally returns a list as a JSON string or a single object. */
+function asArray(v: any): any[] {
+  if (Array.isArray(v)) return v;
+  if (typeof v === "string") {
+    try {
+      const p = JSON.parse(v);
+      return Array.isArray(p) ? p : p ? [p] : [];
+    } catch {
+      return [];
+    }
+  }
+  return v && typeof v === "object" ? [v] : [];
 }
 
 function fromToolInput(raw: any): LibraryPlan {
-  const sfx: SfxSlot[] = (raw.sfx ?? []).map((s: any) => ({
+  const sfx: SfxSlot[] = asArray(raw.sfx).map((s: any) => ({
     kind: "sfx",
     id: slug(s.id ?? s.label),
     label: String(s.label ?? s.id),
@@ -136,10 +199,17 @@ function fromToolInput(raw: any): LibraryPlan {
     genPrompt: String(s.gen_prompt ?? s.label),
     safety: s.safety === "speculative" ? "speculative" : "committed",
     intensity: clamp01(Number(s.intensity ?? 0.5)),
-    maxDurationS: SFX_MAX_S,
+    maxDurationS: Number.isFinite(Number(s.length_s)) && Number(s.length_s) > 0 ? Math.min(5, Math.max(0.6, Number(s.length_s) * 1.5)) : SFX_MAX_S,
     tags: (s.tags ?? []).map(String),
+    instant: Array.isArray(s.instant) ? s.instant.map((t: any) => String(t).toLowerCase().trim()).filter(Boolean) : undefined,
+    emphasis: typeof s.emphasis === "number" ? clamp01(s.emphasis) : undefined,
+    softness: typeof s.softness === "number" ? clamp01(s.softness) : undefined,
+    lengthS: typeof s.length_s === "number" ? Math.min(4, Math.max(0.3, s.length_s)) : undefined,
+    attack: typeof s.attack === "number" ? clamp01(s.attack) : undefined,
+    tail: typeof s.tail === "number" ? clamp01(s.tail) : undefined,
+    event: s.event ? String(s.event) : undefined,
   }));
-  const music: MusicSlot[] = (raw.music ?? []).map((m: any) => ({
+  const music: MusicSlot[] = asArray(raw.music).map((m: any) => ({
     kind: "music",
     id: `music_${slug(m.mood)}`,
     mood: String(m.mood),
@@ -148,7 +218,7 @@ function fromToolInput(raw: any): LibraryPlan {
     intensity: clamp01(Number(m.intensity ?? 0.5)),
     tags: (m.tags ?? []).map(String),
   }));
-  const voice: VoiceSlot[] = (raw.voice ?? []).map((v: any) => ({
+  const voice: VoiceSlot[] = asArray(raw.voice).map((v: any) => ({
     kind: "voice",
     id: `voice_${slug(v.id ?? v.line)}`,
     line: String(v.line),
@@ -162,6 +232,8 @@ function fromToolInput(raw: any): LibraryPlan {
 
 /** Deterministic plan used when Claude is unavailable. Good enough for a demo. */
 export function fallbackPlan(input: SetupInput): LibraryPlan {
+  const moods = input.moods.length ? input.moods : ["calm", "building", "intense", "resolved"];
+  input = { ...input, moods };
   const ids = [...input.themeSfx, ...input.keywords.map(slug)];
   const sfx: SfxSlot[] = ids.map((id) => {
     const phrase = id.replace(/_/g, " ");
@@ -186,19 +258,22 @@ export function fallbackPlan(input: SetupInput): LibraryPlan {
     intensity: input.moods.length > 1 ? i / (input.moods.length - 1) : 0.5,
     tags: [mood, "ambient", "loop"],
   }));
-  return normalizePlan({ sfx, music, voice: [] }, input);
+  return normalizePlan({ sfx, music, voice: [] }, input, true);
 }
 
 // ----------------------------------------------------------------- cleanup
 
-/** Applies layer toggles, adds the base speculative sounds, dedupes, caps sizes. */
-export function normalizePlan(plan: LibraryPlan, input: SetupInput): LibraryPlan {
+/** Applies layer toggles, adds base speculative sounds when the plan has none, dedupes, caps sizes. */
+export function normalizePlan(plan: LibraryPlan, input: SetupInput, forceBase = false, noBase = false): LibraryPlan {
   const seen = new Set<string>();
   const sfx: SfxSlot[] = [];
   if (input.layers.sfx) {
-    for (const base of BASE_SPECULATIVE) {
-      sfx.push({ kind: "sfx", safety: "speculative", maxDurationS: base.id === "drone" ? 20 : 4, tags: words(base.label), ...base });
-      seen.add(base.id);
+    // The AI plan chooses its own speculative sounds; the horror-flavoured defaults only back up a plan without any
+    if (!noBase && (forceBase || !plan.sfx.some((s) => s.safety === "speculative"))) {
+      for (const base of BASE_SPECULATIVE) {
+        sfx.push({ kind: "sfx", safety: "speculative", maxDurationS: base.id === "drone" ? 20 : 4, tags: words(base.label), ...base });
+        seen.add(base.id);
+      }
     }
     for (const s of plan.sfx) {
       if (seen.has(s.id) || !s.queries.length) continue;
@@ -206,23 +281,24 @@ export function normalizePlan(plan: LibraryPlan, input: SetupInput): LibraryPlan
       sfx.push(s);
     }
   }
-  // Music must cover every theme mood, in theme order, so the tracker's mood enum always resolves.
+  // Music covers every requested mood in order (so the tracker's mood enum resolves); with no moods given, the AI's own choice is kept.
+  const moods = input.moods.length ? input.moods : plan.music.map((m) => m.mood);
   const music: MusicSlot[] = !input.layers.music
     ? []
-    : input.moods.map((mood, i) => {
-        const found = plan.music.find((m) => slug(m.mood) === slug(mood));
-        return (
-          found ?? {
-            kind: "music",
-            id: `music_${slug(mood)}`,
-            mood,
-            queries: [`${mood} ambient loop`],
-            genPrompt: `Instrumental ${mood} underscore, sparse, no vocals, loopable`,
-            intensity: input.moods.length > 1 ? i / (input.moods.length - 1) : 0.5,
-            tags: [mood],
-          }
-        );
-      });
+    : moods.map((mood, i) => {
+      const found = plan.music.find((m) => slug(m.mood) === slug(mood));
+      return (
+        found ?? {
+          kind: "music",
+          id: `music_${slug(mood)}`,
+          mood,
+          queries: [`${mood} ambient loop`],
+          genPrompt: `Instrumental ${mood} underscore, sparse, no vocals, loopable`,
+          intensity: moods.length > 1 ? i / (moods.length - 1) : 0.5,
+          tags: [mood],
+        }
+      );
+    });
   const voice = input.layers.voice ? dedupe(plan.voice).slice(0, MAX_VOICE_SLOTS) : [];
   return { sfx: sfx.slice(0, MAX_SFX_SLOTS + BASE_SPECULATIVE.length), music, voice };
 }

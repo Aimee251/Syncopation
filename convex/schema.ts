@@ -23,6 +23,14 @@ export const soundFields = {
   license: v.string(),
   attribution: v.optional(v.string()),
   pageUrl: v.optional(v.string()),
+  // live-trigger metadata written by the planner (so no separate prep pass is needed)
+  instant: v.optional(v.array(v.string())),
+  emphasis: v.optional(v.number()),
+  softness: v.optional(v.number()),
+  attack: v.optional(v.number()),
+  tail: v.optional(v.number()),
+  lengthS: v.optional(v.number()),
+  description: v.optional(v.string()),
   storageId: v.id("_storage"),
 };
 

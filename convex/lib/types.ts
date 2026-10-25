@@ -19,6 +19,7 @@ export interface SetupInput {
   layers: { music: boolean; sfx: boolean; voice: boolean };
   density: Density;
   script?: string;
+  live?: boolean; // a live follow-up round during the talk: the planner acts as a director deciding what (if anything) to add
 }
 
 /** One thing the library must contain. A slot becomes 1–2 stored sounds (variants). */
@@ -32,6 +33,15 @@ export interface SfxSlot {
   intensity: number; // 0–1, used by the tension-fit feature
   maxDurationS: number;
   tags: string[];
+  // live-trigger metadata (optional): phrases that name the sound happening, how noticeable it should be, what it is
+  instant?: string[];
+  emphasis?: number; // story weight 0 = incidental .. 1 = pivotal (not loudness)
+  softness?: number; // the sound's own character: 0 = sharp transient .. 1 = gentle, diffuse
+  // shape metadata decided by the planner in the same call as the queries, so fetch and mixing know it before anything downloads
+  lengthS?: number; // how long this sound should last (drives the search window, the generation length and the playback trim)
+  attack?: number; // 0 = instant onset .. 1 = slow swell in
+  tail?: number; // 0 = clean cut .. 1 = long, lingering fade out
+  event?: string;
 }
 
 export interface MusicSlot {
@@ -58,6 +68,7 @@ export interface LibraryPlan {
   sfx: SfxSlot[];
   music: MusicSlot[];
   voice: VoiceSlot[];
+  read?: string; // live rounds: the evidence the director used (what the speech is about, how well the library fits)
 }
 
 /** A sound found by a search provider, before download. */
@@ -95,6 +106,13 @@ export interface SoundRecord {
   intensity: number;
   mood?: string;
   safety: Safety;
+  instant?: string[];
+  emphasis?: number;
+  softness?: number;
+  attack?: number;
+  tail?: number;
+  lengthS?: number;
+  description?: string;
   durationMs: number;
   loop: boolean;
   source: SourceName;

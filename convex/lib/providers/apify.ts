@@ -27,11 +27,11 @@ export async function searchApify(query: string, opts: ApifyOpts, token: string)
   const mediaType = opts.layer === "music" ? "music" : "soundEffects";
   const input = opts.inputTemplate
     ? JSON.parse(
-        opts.inputTemplate
-          .replaceAll("{{query}}", query.replace(/"/g, ""))
-          .replaceAll("{{mediaType}}", mediaType)
-          .replaceAll("{{maxItems}}", String(maxItems)),
-      )
+      opts.inputTemplate
+        .replaceAll("{{query}}", query.replace(/"/g, ""))
+        .replaceAll("{{mediaType}}", mediaType)
+        .replaceAll("{{maxItems}}", String(maxItems)),
+    )
     : { mode: "search", searchQuery: query, mediaType, maxItems };
 
   const url =
