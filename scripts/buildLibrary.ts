@@ -142,7 +142,13 @@ export function withQuotaAndClaude<T extends { providers: Providers; enabled: st
         const user = `Live talk: "${theme}". For each sound, pick the file(s) that ARE the intended sound (not something else with similar words, ` +
           `no voices/music in an effect, no one-off events in a background loop). [] if none fits.\n\n` +
           items.map((it) => `id ${it.slot.id}: ${describe(it.slot)}\n` + it.cands.map((c, i) => `  ${i}. "${c.name}" [${c.tags.slice(0, 6).join(", ")}] ${c.durationS.toFixed(1)} s${c.rating ? `, rated ${c.rating.toFixed(1)}` : ""}`).join("\n")).join("\n\n");
-        const out = await askClaude(env, "You choose sound files for a live sound designer. Be strict: the file must sound like the described sound.", user, PICK_SCHEMA);
+        const out = await askClaude(env, [
+        "You choose sound files for a live sound designer; the file plays under a speaker the moment they name the event. Judge each file by its name, tags and length:",
+        "- A one-off effect must BE that event, clean and single: not a long field recording, not a different event that shares a word ('door slam' for 'door creak'), no speech or music in it, and a length close to the event (a knock is not 40 s).",
+        "- A background loop must be steady texture with no sudden events, voices up front or music.",
+        "- Music must be instrumental, match the mood and energy, and loop well; reject cartoon, circus, kids, kazoo, novelty or comedy-jingle tracks.",
+        "Pick up to 2, best first; [] when none truly fits (the sound is then generated instead).",
+      ].join("\n"), user, PICK_SCHEMA);
         return items.map((it) => {
           const pick = (out?.picks ?? []).find((x: any) => x.id === it.slot.id);
           return pick ? (pick.choice as number[]).map((i) => it.cands[i]).filter(Boolean) : it.cands; // no answer: keep the tag ranking
@@ -162,6 +168,7 @@ export function withQuotaAndClaude<T extends { providers: Providers; enabled: st
       const user = `Live talk: "${theme}". The online sound search found nothing for the sounds below. These files from earlier talks are on this machine:\n` +
         pool.map((c, i) => `  ${i}. ${c.layer}${c.loop ? " loop" : ""}: "${c.name}" [${c.tags.join(", ")}]`).join("\n") +
         `\n\nFor each needed sound, pick a file ONLY if it genuinely works as that sound in this talk (right kind: music for music, a loop for a background, a one-off for an effect). [] otherwise.\n` +
+        `EXCEPTION — MUSIC: the talk must never be left without background music, so for a music slot always pick the closest music file (mood/energy nearest to the talk), even if it isn't perfect.\n` +
         slots.map((s) => `id ${s.id}: ${describe(s)}`).join("\n");
       const out = await askClaude(env, "You reuse sound files for a live sound designer. Never force a bad fit: silence is better than a wrong sound.", user, PICK_SCHEMA);
       return slots.map((s) => {
@@ -338,7 +345,7 @@ export async function finishLibrary(outDir: string, opts: PipelineOpts = { ...DE
   const { providers } = withQuotaAndClaude(providersFromEnv(cleanEnv()), outDir, themeOf(outDir), true);
   await mkdir(join(outDir, "sounds"), { recursive: true });
   const fresh: Array<SoundRecord & { url: string }> = [];
-  await runPipeline(plan, providers, {
+  const result = await runPipeline(plan, providers, {
     save: async (sound, record) => {
       const ext = sound.contentType.includes("ogg") ? "ogg" : sound.contentType.includes("wav") ? "wav" : "mp3";
       const file = `sounds/${record.id.replace("#", "_")}.${ext}`;
@@ -348,6 +355,9 @@ export async function finishLibrary(outDir: string, opts: PipelineOpts = { ...DE
       await onSound?.(rec);
     },
   }, () => { }, { ...opts, generate: generate ?? opts.generate });
+  // what batch 2 could NOT get, and why (these used to be swallowed, so missing sounds looked like trigger bugs)
+  if (result.missing.length) console.log(`[SCRAPE] batch 2 missing: ${result.missing.join(", ")}`);
+  if (result.log.length) console.log(`[SCRAPE] batch 2 notes:\n  ${result.log.slice(0, 12).join("\n  ")}`);
   await appendToLibrary(outDir, fresh, plan.music.map((m) => m.mood));
   await rm(pendingPath, { force: true });
   return fresh;
@@ -409,6 +419,30 @@ export async function expandLibrary(
     },
   }, () => { }, opts);
   await appendToLibrary(outDir, fresh); // so the next run of the same session has them too
+  return fresh;
+}
+
+/**
+ * FAST LANE (monitor.ts): fetch sounds that are already fully described (search words + metadata), no planning call and
+ * no Claude file choice in between: the first decent search result wins, ElevenLabs makes it when nothing is found.
+ * Each sound is handed to `onSound` the moment it's saved.
+ */
+export async function fetchSlots(slots: SfxSlot[], outDir: string, onSound: (rec: SoundRecord & { url: string }) => void | Promise<void>) {
+  if (!slots.length) return [];
+  const { providers } = withQuotaAndClaude(providersFromEnv(cleanEnv()), outDir, themeOf(outDir), false);
+  await mkdir(join(outDir, "sounds"), { recursive: true });
+  const fresh: Array<SoundRecord & { url: string }> = [];
+  await runPipeline({ sfx: slots, music: [], voice: [] }, providers, {
+    save: async (sound, record) => {
+      const ext = sound.contentType.includes("ogg") ? "ogg" : sound.contentType.includes("wav") ? "wav" : "mp3";
+      const file = `sounds/${record.id.replace("#", "_")}.${ext}`;
+      await writeFile(join(outDir, file), Buffer.from(sound.bytes));
+      const rec = { ...record, url: `/${file}` };
+      fresh.push(rec);
+      await onSound(rec);
+    },
+  }, () => { }, { ...DEFAULT_OPTS, variants: 1, concurrency: Math.max(1, slots.length), budgetMs: 20_000 });
+  await appendToLibrary(outDir, fresh);
   return fresh;
 }
 

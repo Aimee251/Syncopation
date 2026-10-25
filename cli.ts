@@ -76,7 +76,7 @@ async function setup(): Promise<{ dir: string; meta: any }> {
   // │ the held message as the theme and start the scrape the moment the user RELEASES the button (or, better, │
   // │ on the first transcript that already contains the topic). Everything below the trigger stays the same.  │
   // └──────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-  const first = Number(flagVal("first-batch", "6"));
+  const first = Number(flagVal("first-batch", "8"));
   const layers = { music: true, sfx: true, voice: false };
   const density = "expressive" as SetupInput["density"];
   // moods and default sounds are left empty on purpose: the planner (Claude) chooses them from the theme and description
@@ -104,7 +104,7 @@ async function setup(): Promise<{ dir: string; meta: any }> {
   const summary = themeIn, tone = "follow the story";
   const meta = { summary, keywords, tone, density, minutes, theme: themeIn, layers };
 
-  console.log("\n" + bold("Building your sound library") + dim("  (batch 1: opening music + 6 likeliest sounds; the rest loads while you talk)"));
+  console.log("\n" + bold("Building your sound library") + dim("  (batch 1: opening music + 8 likeliest sounds; the rest loads while you talk)"));
   showProgress = true; if (lastProgress) process.stdout.write(lastProgress);
   const err = await build;
   if (err) throw err;
@@ -184,7 +184,8 @@ async function main() {
 
   const args = ["tsx", "--env-file=.env", "predict.ts", "--library", join(dir, "library.json"), "--setup", join(dir, "setup.json"),
     ...passthrough.filter((a, i) => !["--type", "--no-web", "--web", "--first-batch", "--mic"].includes(a) && !["--first-batch", "--mic"].includes(passthrough[i - 1])), ...(mode === "type" ? ["--type"] : []), ...(web ? ["--web"] : [])];
-  const child = spawn("npx", args, { stdio: "inherit" });
+  // tsx directly (not through npx): the talk ends with a hard exit, which npm would report as an error
+  const child = spawn(join("node_modules", ".bin", "tsx"), args.slice(1), { stdio: "inherit" });
   child.on("exit", code => process.exit(code ?? 0));
   process.on("SIGINT", () => { /* forwarded to the child through the shared terminal */ });
   void meta;

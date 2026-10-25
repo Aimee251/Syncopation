@@ -124,7 +124,8 @@ export function setLevel(layer: "music" | "ambience", volume: number) {
 
 /** Speech is happening: dip the beds a little so the voice stays clear */
 export function duck(ms = 2500) { player.speaking(); if (room) room.duck(ms); else if (mixerActive()) send({ type: "duck", ms }); }
-export { pickCompatible, setMixLogger, soundProfile } from "./player";
+// setSpace (the room reverb) only shapes this machine's output; phones in a speaker room play the dry sound for now
+export { pickCompatible, setMixLogger, soundProfile, setSpace } from "./player";
 
 /** Analyse sounds for mixing; in a room, also announce their files so phones load them before any cue needs them. */
 export function preload(sounds: { file?: string; role: string; id: string }[]): string[] {

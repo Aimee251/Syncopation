@@ -14,7 +14,8 @@ import * as readline from "node:readline";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { listen, setKeyterms } from "./stt"; // live voice → text lives in stt.ts
-import { playOnce, setLoop, setLevel, stopAll, duck, playerName, startMixer, startRoom, waitForBrowser, preload, pickCompatible, setMixLogger, soundProfile } from "./mixer"; // browser mixer with afplay fallback (player.ts)
+import { createMonitor, type Found } from "./monitor";
+import { playOnce, setLoop, setLevel, stopAll, duck, playerName, startMixer, startRoom, waitForBrowser, preload, pickCompatible, setMixLogger, soundProfile, setSpace } from "./mixer"; // browser mixer with afplay fallback (player.ts)
 import { expandLibrary, finishLibrary } from "./scripts/buildLibrary"; // extra scraping rounds while the talk is running
 import { providerStatus } from "./convex/lib/pipeline";
 import { inTalkChild } from "./room/talkBridge";
@@ -53,12 +54,12 @@ function startBed(name: "music" | "ambience", s?: Sound) {
 }
 process.on("exit", stopAll);
 // End of talk: music and ambience fade out (~0.5 s) instead of cutting off, then quit
-// The embedding model (onnxruntime) must be released before exit, or macOS aborts with
-// "libc++abi … mutex lock failed: Invalid argument" after the report.
+// onnxruntime (the embedding model) crashes in its own clean-up on macOS ("libc++abi … mutex lock failed") and disposing it
+// races embedding calls still in flight ("Session already disposed"), so after the report the process ends without
+// running native clean-up. The report and weights are written before this.
 const fadeOutAndExit = () => {
   stopAll();
-  const release = Promise.race([Promise.resolve(embedder?.dispose?.()).catch(() => {}), new Promise(r => setTimeout(r, 800))]);
-  setTimeout(() => release.then(() => process.exit(0)), 1000);
+  setTimeout(() => process.kill(process.pid, "SIGKILL"), 1000);
 };
 // /end and Ctrl+C both land here; the report is printed once
 let ended = false;
@@ -249,9 +250,10 @@ function timeNote(): string {
 type State = {
   scene: string; setting: string; tension: number; arc: string; mood: string; on_topic: number; last_sound: string;
   listen_for: { word: string; sound: string }[]; sound_need: number; focus: string; focus_changed: boolean; continues_story: number;
-  current_story: string; adopt_new_story: boolean; scenario: string; thread: string; fits_now?: string[]
+  current_story: string; adopt_new_story: boolean; scenario: string; thread: string; fits_now?: string[];
+  space?: string; fx_blend?: number // SCENE MIX (big picture): the room everything is in, and how effects sit against the music
 };
-type Slot = { slot: number; beat: string; sounds: { id: string; score: number }[] };
+type Slot = { slot: number; beat: string; sounds: { id: string; score: number }[]; missing?: { sound: string; p: number }[] };
 
 function threadList(): string {
   return threads.map(t => `${t.id} = "${t.story || STORY.summary}" (${t === active ? "ACTIVE" : `paused at ${t.arc}, tension ${f2(t.state?.tension ?? 0.3)}`})`).join("; ");
@@ -327,18 +329,23 @@ function scoreFeedback(kind: "fit" | "outcome", good: boolean, insert = false) {
 
 async function predictNext3(recent: string[], index: number, prev: State | null): Promise<{ state: State; slots: Slot[]; ms: number } | null> {
   const started = Date.now();
-  const system = `You track a live, unscripted talk for a sound designer and predict the next 3 moments.
+  // SPEED: everything that changes every sentence (current story, threads, recent speech) goes in the message; the system
+  // text below only changes when the library grows, so Claude's prompt cache reuses it and the answer starts sooner
+  const system = `You track a live, unscripted talk for a sound designer and predict the next 5 moments.
 Follow the SPEAKER, not the plan. The summary below is only a loose guess typed before the talk (it may be a few vague words, a genre label, or simply wrong).
 Original summary: "${STORY.summary}"
-What the speaker is actually talking about now: "${storyNow()}"
-Story threads so far: ${threadList()}
 The speaker may leave a thread and LOOP BACK to it later. Set "thread" to the thread the latest sentence belongs to:
 an existing id if it continues or returns to that thread (pick up where it was left, don't restart it), "new" if it starts
 a different story, "insert" for a one-off random line.
 Keywords: ${STORY.keywords.join(", ")}. Tone: ${STORY.tone}. Density: ${STORY.density}.
 Sound effects: ${CUES.map(s => `${s.id}${s.description ? ` = ${s.description}` : ""}`).join("; ")}
 Music moods available: ${MOODS.join(", ")}. Ambiences: ${SETTINGS.join(", ") || "(none)"}. Set "setting" to "none" when no available ambience fits the place the speaker is actually in: a wrong bed is worse than none.
-Rules: a slot is the next meaningful sentence. For slots +1, +2, +3 give the likely beat (under 12 words) and score up to 5 sounds 0..1.
+Rules: a slot is the next meaningful sentence. For slots +1 … +5 give the likely beat (under 8 words) and score up to 3 sounds 0..1.
+The further ahead, the less sure: +4 and +5 are about where the story is HEADING (scene, likely events), which is what lets sounds be fetched in time.
+When a likely beat would have a sound-making event that NO library sound covers, list it in that slot's "missing" with how likely it is
+(you can't know the future: it's a bet; it is fetched now so it's ready if it comes).
+SCENE MIX (the big picture of the soundtrack): set "space" to where the story is acoustically, and "fx_blend" to how effects should sit
+against the music in THIS scene: melt in for gentle, tender or reflective moments, punch through for sudden danger or a comic beat that must land.
 Keep every text field short.
 listen_for words must name the sound-making EVENT (an action or a noise the audience would hear), never just a place, object or person.
 If the latest sentence is a random insert that doesn't follow from the story so far, mark continues_story low and do NOT let it redirect
@@ -356,38 +363,43 @@ current_story: from then on, follow that story. Never keep forcing the original 
 Whatever the talk is about, use the available music moods and ambiences to make it more compelling (scenario):
 there should always be fitting music; sound effects only where something happens.`;
   const tool = {
-    name: "update_story", description: "Story state + next 3 slots",
+    name: "update_story", description: "Story state + next 5 slots",
     input_schema: {
       type: "object", required: ["state", "slots"],
       properties: {
         state: {
-          type: "object", required: ["scene", "setting", "tension", "arc", "mood", "on_topic", "last_sound", "listen_for", "sound_need", "focus", "focus_changed", "continues_story", "current_story", "adopt_new_story", "scenario", "thread"], properties: {
+          type: "object", required: ["scene", "setting", "tension", "arc", "mood", "on_topic", "last_sound", "listen_for", "sound_need", "focus", "focus_changed", "continues_story", "current_story", "adopt_new_story", "thread", "space", "fx_blend"], properties: {
             thread: { type: "string", description: "which thread the latest sentence belongs to: an existing thread id, 'new', or 'insert'" },
-            current_story: { type: "string", description: "one sentence: the story or topic the speaker is ACTUALLY on now (may differ from the original summary)" },
+            current_story: { type: "string", description: "under 12 words: the story or topic the speaker is ACTUALLY on now (may differ from the original summary)" },
             adopt_new_story: { type: "boolean", description: "true when the speaker has clearly switched to a different story/topic for 2+ sentences (not a single random insert)" },
-            scenario: { type: "string", description: "how the music, ambience and sounds will make THIS part more compelling, in under 15 words" },
             continues_story: { type: "number", description: "0..1: does the sentence that just finished actually follow from what came before (1) or is it a random insert that only sounds related (0)?" },
             sound_need: { type: "number", description: "0..1: how much the story RIGHT NOW calls for sound effects. 1 = vivid action or reveal the audience should hear; 0.5 = atmosphere; 0 = reflection, explanation, emotional confession or punchline where a sound would distract (let music carry it)." },
             focus: { type: "string", description: "the main thread or message of the story right now, in a few words" },
             focus_changed: { type: "boolean", description: "true if the main thread just switched (new topic, new message, flashback, different scene type), not just a new detail" },
-            fits_now: { type: "array", maxItems: 12, items: { type: "string", enum: CUES.map(s => s.id) }, description: "BIG-PICTURE GATE: the sounds that would genuinely ENHANCE the speech if the speaker names them in the next ~20 s, given the whole story so far, its tone and where it is going. A sound that is merely related to a passing mention must NOT be here; a reflective, emotional or punchline moment may have an empty list. Named sounds outside this list stay silent." },
+            fits_now: { type: "array", maxItems: 8, items: { type: "string", enum: CUES.map(s => s.id) }, description: "BIG-PICTURE GATE: the sounds that would genuinely ENHANCE the speech if the speaker names them in the next ~20 s, given the whole story so far, its tone and where it is going. A sound that is merely related to a passing mention must NOT be here; a reflective, emotional or punchline moment may have an empty list. Named sounds outside this list stay silent." },
             listen_for: {
-              type: "array", maxItems: 10, description: "ARMED TRIGGERS: exact words/phrases the speaker will probably say in the next ~20 s that name a sound-making EVENT (e.g. 'doorbell', 'smoke alarm', 'crash'). They are pre-approved: the sound plays INSTANTLY the moment the phrase is heard, with no further check. Only list events, never bare places/objects/people. Replaces the previous list, so drop what the story has moved past.",
+              type: "array", maxItems: 6, description: "ARMED TRIGGERS: exact words/phrases the speaker will probably say in the next ~20 s that name a sound-making EVENT (e.g. 'doorbell', 'smoke alarm', 'crash'). They are pre-approved: the sound plays INSTANTLY the moment the phrase is heard, with no further check. Only list events, never bare places/objects/people. Replaces the previous list, so drop what the story has moved past.",
               items: { type: "object", required: ["word", "sound"], properties: { word: { type: "string" }, sound: { type: "string", enum: CUES.map(s => s.id) } } }
             },
             last_sound: { type: "string", enum: [...CUES.map(s => s.id), "none"], description: "HINDSIGHT: the one sound effect that would have fit the sentence that just finished, or none. Be strict: most sentences are none." },
             on_topic: { type: "number", description: "0..1: how related the LATEST sentence is to the story the speaker is currently on (current_story), not the original summary. Low = a random insert." },
             scene: { type: "string" }, setting: { type: "string", ...(SETTINGS.length ? { enum: [...SETTINGS, "none"] } : {}) }, tension: { type: "number" },
             arc: { type: "string", enum: ["setup", "rising", "climax", "falling", "resolution"] },
-            mood: { type: "string", enum: MOODS }
+            mood: { type: "string", enum: MOODS },
+            space: { type: "string", enum: ["room", "hall", "cave", "outdoors"], description: "SCENE MIX: the acoustic space the story is in right now (sets the echo every effect and the ambience get)" },
+            fx_blend: { type: "number", description: "SCENE MIX: 0..1 how sound effects should sit against the music right now, from the big picture: 0 = melt into the music (gentle opening, tender or reflective moment, bedtime-story tone), 0.5 = clearly heard but part of the soundtrack, 1 = punch through (sudden danger, a crash, a comic beat that needs to land)" }
           }
         },
         slots: {
-          type: "array", minItems: 3, maxItems: 3, items: {
+          type: "array", minItems: 5, maxItems: 5, items: {
             type: "object", required: ["offset", "beat", "sounds"], properties: {
-              offset: { type: "integer", enum: [1, 2, 3] }, beat: { type: "string" },
+              offset: { type: "integer", enum: [1, 2, 3, 4, 5] }, beat: { type: "string" },
+              missing: {
+                type: "array", maxItems: 2, description: "sound-making events this moment would likely have that NO library sound covers (e.g. 'horse galloping'), with how likely each is. They are fetched now, so they are ready if they come; leave empty when the library covers it",
+                items: { type: "object", required: ["sound", "p"], properties: { sound: { type: "string" }, p: { type: "number" } } }
+              },
               sounds: {
-                type: "array", maxItems: 5, items: {
+                type: "array", maxItems: 3, items: {
                   type: "object", required: ["id", "score"], properties: {
                     id: { type: "string", enum: CUES.map(s => s.id) }, score: { type: "number" }
                   }
@@ -404,11 +416,11 @@ there should always be fitting music; sound effects only where something happens
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY!, "anthropic-version": "2023-06-01" },
       body: JSON.stringify({
-        model: "claude-haiku-5-5", max_tokens: 1500, // the reply has many fields; too low a limit cuts it off mid-answer
+        model: "claude-haiku-5-5", max_tokens: 2200, // 5 slots: too low a limit cuts the reply off mid-answer
         system: [{ type: "text", text: system, cache_control: { type: "ephemeral" } }],
         tools: [tool], tool_choice: { type: "tool", name: "update_story" },
         messages: [{
-          role: "user", content: `Previous state: ${JSON.stringify(prev ?? {})}\n${timeNote()}\nStory so far:\n${recent.join("\n")}\nSentence [${index}] just finished. Judge it in hindsight (last_sound), then predict [${index + 1}], [${index + 2}], [${index + 3}]. Rethink where the story is going from everything said so far; drop old expectations the speaker has moved past.${rethink.pending ? `
+          role: "user", content: `What the speaker is actually talking about now: "${storyNow()}"\nStory threads so far: ${threadList()}\nPrevious state: ${JSON.stringify(prev ?? {})}\n${timeNote()}\nStory so far:\n${recent.join("\n")}\nSentence [${index}] just finished. Judge it in hindsight (last_sound), then predict [${index + 1}] … [${index + 5}]. Rethink where the story is going from everything said so far; drop old expectations the speaker has moved past.${rethink.pending ? `
 IMPORTANT: your recent predictions kept missing what the speaker actually said (${rethink.reason}). Throw away your old picture and rebuild it from scratch from the speech itself: what is this talk really about, where is it going next, which sounds will fit.` : ""}`
         }],
       }),
@@ -435,13 +447,15 @@ IMPORTANT: your recent predictions kept missing what the speaker actually said (
       focus: keep(st.focus, prev?.focus ?? ""), focus_changed: !!st.focus_changed, continues_story: num(st.continues_story, 1),
       current_story: keep(st.current_story, prev?.current_story ?? ""), adopt_new_story: !!st.adopt_new_story,
       scenario: keep(st.scenario, prev?.scenario ?? ""), thread: keep(st.thread, ""),
+      space: keep(st.space, prev?.space ?? "room"), fx_blend: num(st.fx_blend, prev?.fx_blend ?? 0.5),
     };
     const missing = ["scene", "arc", "mood", "tension", "focus"].filter(k => st[k] === undefined || st[k] === "");
     if (missing.length) console.error(`[CLAUDE] reply left out ${missing.join(", ")} — kept the previous values`);
     if (!Array.isArray(out.slots) || !out.slots.length) console.error("[CLAUDE] reply had no predictions — the previous ones stay active");
     const slots: Slot[] = (Array.isArray(out.slots) ? out.slots : [])
       .filter((s: any) => s && typeof s.offset === "number")
-      .map((s: any) => ({ slot: index + s.offset, beat: s.beat ?? "", sounds: Array.isArray(s.sounds) ? s.sounds : [] }));
+      .map((s: any) => ({ slot: index + s.offset, beat: s.beat ?? "", sounds: Array.isArray(s.sounds) ? s.sounds : [],
+        missing: Array.isArray(s.missing) ? s.missing.filter((m: any) => m && typeof m.sound === "string" && typeof m.p === "number") : [] }));
     return { state, ms: Date.now() - started, slots };
   } catch (e) {
     console.error("Claude call failed:", e);
@@ -456,7 +470,7 @@ type Expect = { id: string; score: number; beat: string; madeAt: number; offset:
 let expects: Expect[] = [];
 
 function ingestPrediction(madeAt: number, slots: Slot[]) {
-  expects = expects.filter(e => madeAt - e.madeAt < 3);            // forget stale guesses
+  expects = expects.filter(e => madeAt - e.madeAt < 3 && e.madeAt + e.offset >= madeAt); // forget stale and passed guesses
   for (const sl of slots) for (const x of sl.sounds)
     expects.push({ id: x.id, score: x.score, beat: sl.beat, madeAt, offset: sl.slot - madeAt });
 }
@@ -465,7 +479,7 @@ function prior(now: number): Map<string, { p: number; beat: string }> {
   const out = new Map<string, { p: number; beat: string }>();
   for (const e of expects) {
     const age = Math.max(0, now - 1 - e.madeAt);                     // 0 = newest prediction
-    const p = e.score * [1, 0.8, 0.6][Math.min(age, 2)] * [1, 1, 0.9, 0.8][Math.min(e.offset, 3)];
+    const p = e.score * [1, 0.8, 0.6][Math.min(age, 2)] * [1, 1, 0.9, 0.8, 0.7, 0.6][Math.min(e.offset, 5)];
     if (p > (out.get(e.id)?.p ?? 0)) out.set(e.id, { p, beat: e.beat });
   }
   return out;
@@ -485,7 +499,26 @@ const BASE_TAU = { subtle: 0.8, normal: 0.65, expressive: 0.45 }; // min p(play)
 let TAU = BASE_TAU[STORY.density]; // silence threshold; set after setup, nudged by /skip and /good
 const lastPlayed = new Map<string, number>();
 // "dings" → "ding", "roared" → "roar"; short words keep their letters ("ding" must not become "d", "ring" not "r")
-const stem = (w: string) => { const c = w.toLowerCase().replace(/[^a-z]/g, ""); const r = c.replace(/(ing|ed|es|s)$/, ""); return r.length >= 3 ? r : c; };
+// irregular past tenses that name sounds ("the phone rang" must match "phone rings")
+const IRREGULAR: Record<string, string> = {
+  rang: "ring", rung: "ring", broke: "break", broken: "break", shot: "shoot", fell: "fall", fallen: "fall", blew: "blow", blown: "blow",
+  threw: "throw", thrown: "throw", struck: "strike", sang: "sing", sung: "sing", shook: "shake", shaken: "shake", froze: "freeze",
+  tore: "tear", torn: "tear", woke: "wake", spoke: "speak", swung: "swing", drove: "drive", rode: "ride", ran: "run", hit: "hit",
+  bit: "bite", burst: "burst", flew: "fly", dug: "dig", hung: "hang", stuck: "stick", sank: "sink", sprang: "spring", leapt: "leap", crept: "creep", wept: "weep",
+};
+const stem = (w: string) => {
+  const c = w.toLowerCase().replace(/[^a-z]/g, "");
+  let r = IRREGULAR[c] ?? c;
+  if (!IRREGULAR[c]) {
+    if (/(ing|(?<!e)ed)$/.test(r)) {
+      r = r.replace(/(ing|ed)$/, "");
+      if (/([bdgmnprt])\1$/.test(r)) r = r.slice(0, -1);        // slammed → slam, stopped → stop, running → run
+    } else if (/(ss|x|z|ch|sh)es$/.test(r)) r = r.slice(0, -2); // glasses → glass, crashes → crash
+    else if (/[^s]s$/.test(r)) r = r.slice(0, -1);              // barks → bark (but hiss stays hiss)
+  }
+  if (r.length > 3 && r.endsWith("e")) r = r.slice(0, -1);       // chime / chimed / chimes all → chim
+  return r.length >= 3 ? r : c;
+};
 
 // A tag matches if its word (or every word of a multi-word tag, in order) is in the sentence
 const norm = (t: string) => " " + t.split(/\s+/).map(stem).filter(Boolean).join(" ") + " ";
@@ -733,7 +766,7 @@ Music must stay under the voice (never above 0.85). Save the biggest moments for
 }
 
 // Live mix state — smoothed, so levels glide instead of jumping
-const mix = { music: 0.2, ambience: 0.4, arc: "setup" as Arc, usedInArc: 0, sentencesSinceSfx: 99 };
+const mix = { music: 0.5, ambience: 0.4, arc: "setup" as Arc, usedInArc: 0, sentencesSinceSfx: 99 };
 const MAX_STEP = 0.16; // max level change per sentence (raise for faster swells, lower for smoother)
 const glide = (from: number, to: number) => from + Math.max(-MAX_STEP, Math.min(MAX_STEP, to - from));
 type Row = {
@@ -750,7 +783,8 @@ function updateMix(tension: number) {
   // tension pushes music up inside the part's range; when effects aren't needed, music carries a bit more
   // music swings with tension (calm = softer, tense = louder) but never disappears; ceiling 0.6 keeps it under the effects
   const swing = 0.5 + 0.5 * Math.pow(Math.max(0, Math.min(1, tension)), 1.2);
-  const target = Math.min(0.6, sec.music * swing * 1.2 + 0.06 * (1 - (state?.sound_need ?? 0.5)));
+  // floor 0.45: the plan's quiet parts (0.25 × calm) used to sit ~28 dB down and vanish under the voice ducking
+  const target = Math.min(0.8, 0.45 + 0.45 * (sec.music * swing * 1.2 + 0.06 * (1 - (state?.sound_need ?? 0.5))));
   mix.music = glide(mix.music, target);
   // predict.ts only states the INTENT (plan levels); the mixer (player.ts) keeps the ambience under the music
   mix.ambience = glide(mix.ambience, sec.ambience);
@@ -818,8 +852,13 @@ function vote(name: "music" | "ambience", value: string) {
   L.n = value === L.vote ? L.n + 1 : 1; L.vote = value;
   // nothing playing yet → start now (never leave the talk without music); later switches need 2 votes
   if (L.n < 2 && L.now) return say(C.music, "MUSIC", `${name} leaning ${value} (1/2)`);
-  const found = LIBRARY.find(s => (name === "music" ? s.mood : s.setting) === value);
-  // no file for it (yet): keep what's playing instead of "switching" to nothing (the "(undefined)" lines)
+  let found = LIBRARY.find(s => (name === "music" ? s.mood : s.setting) === value);
+  // no file for that mood yet: with NO music playing, start any music that has a file (never a talk without music);
+  // otherwise keep what's playing instead of "switching" to nothing
+  if (!found?.files?.length && name === "music" && !L.now) {
+    found = LIBRARY.find(s => s.role === "music" && s.files?.length);
+    if (found) value = found.mood ?? value;
+  }
   if (!found?.files?.length) { L.vote = ""; L.n = 0; return; }
   const sound = found?.id;
   const verb = L.now ? "SWITCH" : "START";
@@ -891,6 +930,9 @@ function treatment(r: Cand, volScale = 1) {
   const expected = r.live || r.beat || fitsNow?.has(r.s.id) ? 1 : 0;
   // presence: how far this sound should come forward right now (0 = sit inside the music, 1 = clearly in front)
   let presence = 0.45 * emphasisOf(r.s) + 0.4 * sceneEnergy + 0.15 * expected + 0.15 * (need - 0.5) + 0.12 * (r.s.intensity - 0.5) - (1 - volScale);
+  // BIG PICTURE FIRST: Claude's scene mix (fx_blend) decides how effects sit in this scene; the sound's own metadata
+  // (emphasis, intensity) only moves it within that
+  if (typeof state?.fx_blend === "number") presence = 0.6 * Math.max(0, Math.min(1, state.fx_blend)) + 0.4 * presence;
   presence = Math.max(0, Math.min(1, presence));
   // softening grows when the sound should sit back or is gentle by nature
   const soften = Math.max(0, Math.min(1, 0.55 * (1 - presence) + 0.45 * softnessOf(r.s)));
@@ -898,9 +940,10 @@ function treatment(r: Cand, volScale = 1) {
   const lowpassHz = soften < 0.3 ? undefined : Math.round(Math.exp(Math.log(16000) + (Math.log(4000) - Math.log(16000)) * ((soften - 0.3) / 0.7)));
   return {
     presence, soften, lowpassHz,
-    // always at least a little IN FRONT of the music (+2 … +12 dB): "tucked under" (down to -4 dB) plus the voice on
-    // top made effects inaudible. Sitting back is done by softening and room, not by burying it.
-    liftDb: 2 + 10 * presence,
+    // +1 … +8 dB over the music, from the planner's emphasis + the scene: a passing detail sits just above the music
+    // (blends in), a pivotal hit stands out. Was +2 … +12, which with the ducking left effects ~15-20 dB over the music:
+    // every sound popped out on its own instead of merging. Never below +1: under the voice it would vanish.
+    liftDb: 1 + 7 * presence,
     wet: 0.5 + 0.8 * soften,
     // fades: the planner decided how this sound starts (attack) and ends (tail); the scene's softening is blended in so a
     // sound that has to sit back also eases in and dissolves out, and a hard hit in a tense scene keeps its natural edge
@@ -926,7 +969,8 @@ function playSound(r: Cand, word: string, text: string, tag = "PLAY", volScale =
 //   · an INSTANT phrase that names the sound itself ("dog barks", "gunshot"; library prep writes these once).
 // A bare noun ("my dog", "the door") is never instant. Only the last 6 words are scanned, so a sound is never
 // triggered by something said long ago: late is worse than silent.
-const instantGate = { last: 0 };
+const instantGate = { last: 0, prevTail: [] as string[] };
+const REPEAT_MS = 15_000; // the same effect again within 15 s sounds like a glitch
 const usedWord = new Map<string, number>(); // stemmed trigger word → when a sound last fired on it
 const SMALL = new Set(["the", "a", "an", "my", "his", "her", "their", "our", "your", "its", "went", "off", "up", "on", "of", "to", "and", "is", "was", "are"]);
 // Claude's big-picture list (refreshed every sentence): sounds that genuinely enhance the story right now.
@@ -934,7 +978,7 @@ const SMALL = new Set(["the", "a", "an", "my", "his", "her", "their", "our", "yo
 let fitsNow: Set<string> | null = null;
 function instantScan(text: string, lagMs: number, arrived: number): boolean {
   const now = Date.now();
-  if (now - instantGate.last < 700) return false; // sounds don't pile up
+  if (now - instantGate.last < 1500) return false; // sounds don't pile up ("a gunshot cracked" = one event, not gunshot + glass crack)
   // LOOSER MATCHING: the last 8 words; a phrase's words may be up to 4 words apart, in any order
   // ("engines roared" ~ "the engines are already roaring", "doorbell rang" ~ "the doorbell finally rang")
   const tailWords = text.split(/\s+/).slice(-8).map(stem).filter(Boolean);
@@ -950,7 +994,7 @@ function instantScan(text: string, lagMs: number, arrived: number): boolean {
   };
   const hits: { s: Sound; x: number[]; pr: any; armed?: string; hitPhrase: string; hitWords: string[]; rank: number }[] = [];
   for (const s of CUES) {
-    if (early.played.some(e => e.id === s.id) || now - (lastPlayed.get(s.id) ?? 0) < 5000) continue;
+    if (early.played.some(e => e.id === s.id) || now - (lastPlayed.get(s.id) ?? 0) < REPEAT_MS) continue;
     // a single ARMED word must itself be a noise ("thunder", "bang") or one of the sound's instant phrases; a bare
     // object ("elevator", "door") can be mentioned without the sound ("the elevator at my gym is broken")
     const armable = (w: string) => w.trim().split(/\s+/).length > 1 || EVENT_WORD.test(w.trim().toLowerCase()) || (s.instant ?? []).includes(w.trim().toLowerCase());
@@ -961,7 +1005,14 @@ function instantScan(text: string, lagMs: number, arrived: number): boolean {
     // (Claude's on-topic < 0.2) gets nothing it didn't arm.
     const single = !!named && named.trim().split(/\s+/).length === 1;
     if (named && (state?.on_topic ?? 1) < 0.2) continue;
-    if (single && ((fitsNow && !fitsNow.has(s.id)) || (state?.sound_need ?? 0.5) < 0.2)) continue;
+    // a single word ("ring") needs Claude's big-picture OK, OR another word of the sound itself right next to it
+    // ("the PHONE rang" → phone_ring yes; "the castle bells rang" → phone_ring no)
+    if (single) {
+      const w0 = stem(named!.trim());
+      const ownOther = [...s.id.split("_"), ...(s.description ?? "").split(/\s+/)].map(stem).filter(w => w && w !== w0 && !SMALL.has(w));
+      const backed = ownOther.some(w => tailWords.includes(w));
+      if ((!backed && (!fitsNow || !fitsNow.has(s.id))) || (state?.sound_need ?? 0.5) < 0.2) continue;
+    }
     if (!armed && !named) continue;
     // ONE SPOKEN WORD = ONE SOUND: "glass shattered" must not fire both glass_break and plate_crash
     const hitWords = ((armed ?? named)!).split(/\s+/).map(stem).filter(w => w && !SMALL.has(w));
@@ -977,8 +1028,12 @@ function instantScan(text: string, lagMs: number, arrived: number): boolean {
     const rank = (armed ? 3 : 0) + owns * 3.5 + (pr?.p ?? 0) * 2 + (fitsNow?.has(s.id) ? 1 : 0) + Math.min(2, hitPhrase.trim().split(/\s+/).length) * 0.3;
     hits.push({ s, x, pr, armed, hitPhrase, hitWords, rank });
   }
-  if (!hits.length) return false;
-  const { s, x, pr, armed, hitPhrase, hitWords } = hits.sort((a, b) => b.rank - a.rank)[0];
+  const lastWord = tailWords[tailWords.length - 1];
+  const prevTail = instantGate.prevTail;
+  instantGate.prevTail = tailWords;
+  const stable = hits.filter(h => h.hitWords.length > 1 || h.hitWords[0] !== lastWord || prevTail.includes(h.hitWords[0]));
+  if (!stable.length) return false;
+  const { s, x, pr, armed, hitPhrase, hitWords } = stable.sort((a, b) => b.rank - a.rank)[0];
   instantGate.last = now;
   for (const w of hitWords) usedWord.set(w, now);
   // prominence follows confidence: armed (Claude expected it) full, name-only a little softer
@@ -997,6 +1052,7 @@ const early = { played: [] as { id: string; x: number[] }[], busy: false, lastWo
 async function handlePartial(text: string, lagMs = 0) {
   const arrived = Date.now();
   duck(); // words are coming in: dip the beds so the voice stays clear
+  monitor?.watch(text); // fast lane: named sounds the library doesn't have (background, never waited on)
   if (instantScan(text, lagMs, arrived)) return;
   const n = text.split(/\s+/).length;
   if (!early.t0) early.t0 = Date.now();
@@ -1011,7 +1067,9 @@ async function handlePartial(text: string, lagMs = 0) {
     // fire early when the words confirm a prediction, or when one sound is clearly named (phrase / live keyword)
     if (c.length !== 1 || c[0].weak || c[0].p <= tauNow || planBlocks(c[0].s)) return;
     if (!cf.confirmed && !(c[0].overlap >= 0.75 || c[0].live)) return;
+    if (Date.now() - (lastPlayed.get(c[0].s.id) ?? 0) < REPEAT_MS) return;
     const word = triggerWord(text, c[0].s)?.word ?? "";
+    if (!word) return; // nothing in the words names it: the sentence-level decision handles it
     say(C.fast, "FIT", `"${text}" confirms "${cf.bestBeat}" (${f2(cf.fitPrediction)}) — firing before the sentence ends`);
     playSound(c[0], word, text, "PLAY EARLY");
     lat.early.push(lagMs + (Date.now() - arrived));
@@ -1037,6 +1095,7 @@ async function handle(text: string, arrived = Date.now()) {
   text = text.trim();
   if (!text) return;
   if (text.startsWith("/")) return command(text);
+  monitor?.watch(text, true);
   if (progress() > 1 && !overtimeWarned) { overtimeWarned = true; say(C.music, "TIME", `past the ${clock.estMin} min estimate. Type /time N to extend, or the sound will wind down.`); }
   say(C.heard, "HEARD", text);
   const slot = index + 1;
@@ -1151,12 +1210,18 @@ async function handle(text: string, arrived = Date.now()) {
     const onThread = threadChanged || !r.state.thread || r.state.thread === active.id;
     lastTracked = i; state = r.state;
     if (onThread) active.state = r.state;
+    if (r.state.space) setSpace(r.state.space);
     if (rethink.pending) { rethink.pending = false; rethink.lowStreak = 0; rethink.surpriseStreak = 0; say(C.slow, "REGENERATE", "new picture in place"); }
     lat.claude.push(r.ms);
     const row = timeline.find(t => t.i === i);
     if (row) { row.onTopic = r.state.on_topic; row.claudeMs = r.ms; }
     ingestPrediction(i, r.slots);
-    topUp(r.slots.map(s => s.beat).filter(Boolean).join("; ")); // another scraping round for what is coming (background)
+    // PREFETCH (a bet, not a certainty): sounds Claude expects in the next moments that the library lacks are fetched now,
+    // the likeliest first, so they're ready IF they come; the ones that never come cost a fetch, nothing else
+    const bets = r.slots.flatMap(s => (s.missing ?? []).map(m => ({ ...m, beat: s.beat }))).filter(m => m.p >= 0.35).sort((a, b) => b.p - a.p).slice(0, 4);
+    if (bets.length) say(C.slow, "PREFETCH", bets.map(b => `${b.sound} ${f2(b.p)}`).join(", "));
+    topUp(r.slots.map(s => s.beat).filter(Boolean).join("; ") +
+      (bets.length ? `\nLikely next sounds the library LACKS (fetch these first): ${bets.map(b => `${b.sound} (p ${f2(b.p)})`).join(", ")}` : ""), bets.length > 0);
     if (onThread) { setLiveWords(r.state.listen_for); if (Array.isArray(r.state.fits_now)) fitsNow = new Set(r.state.fits_now); }
     say(C.slow, "NEED", `sound need ${bar(r.state.sound_need ?? 0.5)} ${f2(r.state.sound_need ?? 0.5)} | focus: ${r.state.focus}`);
     if (r.state.scenario) say(C.slow, "SCENE", r.state.scenario);
@@ -1210,11 +1275,31 @@ async function mergeSounds(fresh: any[], dir: string, prep = true): Promise<Soun
   indexLibrary();
   preload(added.flatMap(s => (s.files ?? []).map(file => ({ file, role: s.role, id: s.id }))));
   if (prep) await prepareLibrary(); // trigger + instant phrases for the new sounds
+  // the first music to arrive (batch 1 had none) starts straight away
+  const music = added.find(s => s.role === "music" && s.files?.length);
+  if (music && !layer.music.now) vote("music", music.mood ?? "");
   return added;
 }
 
 // BATCH 2: cli.ts fetched only the opening music + the likeliest effects before the talk; the rest of the plan
 // (pending.json) is fetched here in the background, and each part joins the talk as soon as it's in
+// MONITOR (monitor.ts): a sound that was named but missing has just been fetched. In time → it plays now; too late for a
+// sharp hit → kept for the next mention (its instant phrases came with it); soft lasting sounds may still fade in late.
+let monitor: ReturnType<typeof createMonitor> | null = null;
+const FAST_DEADLINE_MS = 1500;
+async function onFound(f: Found) {
+  const added = await mergeSounds([f.rec], dirname(LIBRARY_FILE), false);
+  const s = added[0] ?? LIBRARY.find(x => x.id === f.rec.slotId);
+  if (!s?.files?.length) return;
+  const late = Date.now() - f.heardAt;
+  const lasting = (s.softness ?? 0.5) >= 0.55 && ((s.lengthS ?? 1) >= 1.5 || (s.attack ?? 0) >= 0.4);
+  const fresh = Date.now() - (lastPlayed.get(s.id) ?? 0) >= REPEAT_MS;
+  const what = fresh && late <= FAST_DEADLINE_MS ? "played in time" : fresh && lasting && late <= 9000 ? "faded in late" : "kept for the next mention";
+  say(C.slow, "MONITOR", `${s.id} ready ${late} ms after "${f.word}" (Claude ${f.askedMs} ms) → ${what}`);
+  if (what === "played in time") playSound({ s, x: [], p: 0.8, live: false, beat: "" }, f.word, f.word, "PLAY FAST");
+  else if (what === "faded in late") playSound({ s, x: [], p: 0.6, live: false, beat: "" }, f.word, f.word, "PLAY LATE", 0.85);
+}
+
 async function loadBatch2() {
   const dir = dirname(LIBRARY_FILE);
   // the full plan is still being made in the background (cli.ts keeps `pending.waiting` until pending.json is written)
@@ -1250,15 +1335,20 @@ async function loadBatch2() {
 // mention and the following sentences, and ambience beds can start straight away.
 // FRONT-END NOTE: the same loop works unchanged on streamed transcripts from press-and-hold voice messages (one message = one chunk).
 const heardQueue: string[] = [];
-const MAX_TOPUPS = 12, TOPUP_GAP_MS = 8_000;
+const MAX_TOPUPS = 20, TOPUP_GAP_MS = 4_000; // faster rounds: a sound must be in the library before it's named
 let topUps = 0, lastTopUp = 0, topUpBusy = false, stuckSaid = false;
-async function topUp(upcoming: string) {
+let pendingBets = "";
+async function topUp(upcoming: string, urgent = false) {
+  if (urgent) pendingBets = upcoming; // kept until a round runs, even if one is busy now
   if (topUpBusy || topUps >= MAX_TOPUPS || LIBRARY === DEMO_LIBRARY || !existsSync(LIBRARY_FILE)) return;
+  if (!upcoming && pendingBets) { upcoming = pendingBets; urgent = true; }
   if (!heardQueue.length && !upcoming) return;
-  if (topUps > 0 && Date.now() - lastTopUp < TOPUP_GAP_MS) return; // what was heard stays queued for the next round
+  if (!urgent && topUps > 0 && Date.now() - lastTopUp < TOPUP_GAP_MS) return; // what was heard stays queued for the next round
+  if (urgent) pendingBets = "";
   if (providerStatus().stuck) { heardQueue.length = 0; if (!stuckSaid) { stuckSaid = true; say(C.slow, "SCRAPE", "Freesound is rate-limited and ElevenLabs is out of credits: live scraping is paused (no sounds can be fetched right now)"); } return; }
   topUpBusy = true; lastTopUp = Date.now(); topUps++;
   const heard = heardQueue.splice(0).slice(-6).join(" ") || recent.slice(-2).join(" ");
+  const heardAt = Date.now();
   const dir = dirname(LIBRARY_FILE);
   try {
     say(C.slow, "SCRAPE", `round ${topUps + 1}: asking the live director about "${heard.slice(0, 80)}${heard.length > 80 ? "…" : ""}"`);
@@ -1279,10 +1369,21 @@ async function topUp(upcoming: string) {
     });
     const added = await mergeSounds(fresh, dir);
     if (!added.length) return;
+    // LATE ENTRY: a sound named in what was just said arrived too late for the word. Soft, lasting sounds (birdsong, wind,
+    // a crowd, rain) still work faded in a few seconds late; sharp one-offs (a crash, a knock) would sound wrong late → skipped.
+    // Decided from the sound's own metadata, not from its name.
+    for (const s of added) {
+      if (s.role !== "sfx" || Date.now() - heardAt > 9000 || Date.now() - (lastPlayed.get(s.id) ?? 0) < REPEAT_MS) continue;
+      const lasting = (s.softness ?? 0.5) >= 0.55 && ((s.lengthS ?? 1) >= 1.5 || (s.attack ?? 0) >= 0.4);
+      const tw = triggerWord(heard, s);
+      if (!lasting || !tw) continue;
+      playSound({ s, x: [], p: 0.6, live: false, beat: "" } as any, tw.word, heard, "PLAY LATE", 0.85);
+      break; // one late entry per round at most
+    }
     say(C.slow, "SCRAPE", `added ${added.length} sounds in ${((Date.now() - lastTopUp) / 1000).toFixed(0)} s: ${added.map(s => s.id).join(", ")}`);
   } catch (e) {
     say(C.slow, "SCRAPE", `follow-up scrape failed (${(e as Error).message}); continuing with the current library`);
-  } finally { topUpBusy = false; if (heardQueue.length) setTimeout(() => topUp(""), TOPUP_GAP_MS); } // speech that arrived meanwhile
+  } finally { topUpBusy = false; if (pendingBets) topUp(""); else if (heardQueue.length) setTimeout(() => topUp(""), TOPUP_GAP_MS); } // bets first, then speech that arrived meanwhile
 }
 
 async function main() {
@@ -1361,6 +1462,11 @@ async function main() {
   if (analysed.length) console.log("Music & stingers (tempo, key):\n  " + analysed.join("\n  "));
   clock.startedAt = Date.now();
   loadBatch2(); // background: the rest of the library arrives while you talk
+  if (LIBRARY !== DEMO_LIBRARY && existsSync(LIBRARY_FILE)) monitor = createMonitor({
+    dir: dirname(LIBRARY_FILE),
+    library: () => LIBRARY.filter(s => s.role !== "music").map(s => `${s.id}${s.description ? ` (${s.description.slice(0, 30)})` : ""}`),
+    onFound, log: m => say(C.slow, "MONITOR", m),
+  });
   active.story = STORY.summary; threads.push(active);
   // Music from the first second (the library's first mood); the ambience starts as soon as Claude
   // has heard enough to know where the talk is set

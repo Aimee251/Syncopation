@@ -8,3 +8,4 @@ public/sounds/*.wav
 public/sounds/*.ogg
 library.prepared.json
 sessions/
+.cache/

@@ -36,7 +36,8 @@ const dbToGain = (db: number) => Math.pow(10, db / 20);
 // ~-29 dB in a render: near-silent on laptop speakers). -15 puts music around -25 dB and effects at -23..-13 dB.
 const BED_DB = Number(process.env.MIX_BED_DB ?? -15);      // music + ambience loudness
 const FX_DB = Number(process.env.MIX_FX_DB ?? -11);        // instant sound loudness (was -12)
-const FX_DUCK_DB = Number(process.env.MIX_FX_DUCK_DB ?? -9); // extra dip of the beds under each effect (was -4)
+const FX_DUCK_DB = Number(process.env.MIX_FX_DUCK_DB ?? -5); // dip of the beds under a pivotal effect (-9 made the music drop out: effects sounded cut out of the mix)
+const FX_DUCK_MAX_S = 0.8; // the music dips only under the HIT; the effect's tail rides back inside the music
 
 // =====================================================================
 // ANALYSIS: tempo, beat phase, key — the same things DJ software reads from a track
@@ -334,7 +335,7 @@ export function playOnce(file: string | undefined, volume: number, opts: { role?
   // measured correction: a sharp clip was peak-limited when normalised and ends up quieter than a smooth one; add that
   // back: half of the deficit (short transients are heard louder than their RMS says), up to 8 dB, so "+6 dB over the music"
   // is what is heard for every clip, not just the smooth ones
-  if (opts.liftDb !== undefined && p.prof) gain = Math.min(1, gain * dbToGain(Math.min(8, Math.max(0, -p.prof.levelDb * 0.5))));
+  if (opts.liftDb !== undefined && p.prof) gain = Math.min(1, gain * dbToGain(Math.min(4, Math.max(0, -p.prof.levelDb * 0.5)))); // was up to 8 dB: sharp clips jumped out
   // the further an effect sits under/over the music, the less/more it pushes the music down
   const duckDb = opts.liftDb !== undefined ? FX_DUCK_DB * Math.min(1, Math.max(0.15, (opts.liftDb + 2) / 11)) : FX_DUCK_DB;
   const music = infoOf(beds.music?.file);
@@ -349,7 +350,7 @@ export function playOnce(file: string | undefined, volume: number, opts: { role?
   const trimmed = buf !== p.buf;
   const go = () => {
     // duck first, then let the effect in a moment later
-    fxUntil = Math.max(fxUntil, Date.now() + LOOKAHEAD_MS + (buf.length / SR) * 1000);
+    fxUntil = Math.max(fxUntil, Date.now() + LOOKAHEAD_MS + Math.min(buf.length / SR, FX_DUCK_MAX_S) * 1000);
     curDuckDb = duckDb;
     const seconds = buf.length / SR;
     const attack = Math.min(opts.attackMs ?? 0, seconds * 400); // never more than 40% of what is played
@@ -460,13 +461,25 @@ function running(): boolean {
 // they happen in the same space instead of being pasted on top
 const combs = [1557, 1617, 1491, 1422].map(n => ({ b: new Float32Array(n), i: 0, lp: 0 }));
 const aps = [225, 556].map(n => ({ b: new Float32Array(n), i: 0 }));
-const REVERB_WET = 0.14;
+// The SPACE of the scene (decided by Claude in the slow loop, see setSpace): how long the room rings and how much of it is
+// heard. The values glide, so a change of place is a smooth transition, not a jump.
+const SPACES: Record<string, { fb: number; wet: number }> = {
+  room: { fb: 0.74, wet: 0.12 }, hall: { fb: 0.84, wet: 0.2 }, cave: { fb: 0.89, wet: 0.3 }, outdoors: { fb: 0.6, wet: 0.06 },
+};
+const space = { fb: 0.74, wet: 0.12, fbT: 0.74, wetT: 0.12, name: "room" };
+export function setSpace(name: string) {
+  const s = SPACES[name];
+  if (!s || name === space.name) return;
+  space.name = name; space.fbT = s.fb; space.wetT = s.wet;
+  log(`space → ${name} (room ${s.fb}, wet ${s.wet})`);
+}
+const AMBIENCE_SEND = 0.35; // the place's own background sound goes through the same room as the effects
 function room(x: number): number {
   let y = 0;
   for (const c of combs) {
     const d = c.b[c.i];
     c.lp = d * 0.7 + c.lp * 0.3;           // damping: tails get darker, like a real room
-    c.b[c.i] = x + c.lp * 0.78;
+    c.b[c.i] = x + c.lp * space.fb;
     c.i = (c.i + 1) % c.b.length;
     y += d;
   }
@@ -489,8 +502,9 @@ function tick() {
   const fxTarget = now < fxUntil ? dbToGain(curDuckDb) : 1;
   for (let i = 0; i < want; i++) {
     duckSpeech += (speechTarget - duckSpeech) * (speechTarget < duckSpeech ? 0.0005 : 0.0001); // ~50 ms down, ~250 ms up
-    duckFx += (fxTarget - duckFx) * (fxTarget < duckFx ? 0.0015 : 0.00008);                      // dips in ~15 ms, comes back over ~0.3 s
+    duckFx += (fxTarget - duckFx) * (fxTarget < duckFx ? 0.0004 : 0.00004);                      // dips in ~60 ms, swells back over ~0.6 s (no audible "hole")
     const bedDuck = duckSpeech * duckFx;
+    if ((i & 1023) === 0) { space.fb += (space.fbT - space.fb) * 0.02; space.wet += (space.wetT - space.wet) * 0.02; } // ~2 s glide
     let bedSum = 0, fxSum = 0, wetSum = 0;
     for (const v of voices) {
       if (v.fade) stepFade(v);
@@ -501,9 +515,13 @@ function tick() {
         if (v.relFrom !== undefined && v.pos > v.relFrom) { const u = (v.pos - v.relFrom) / v.relLen!; s *= Math.cos(Math.min(1, u) * Math.PI / 2); } // equal-power release
         s *= v.gain; fxSum += s; wetSum += s * (v.wet ?? 1);
       }
-      else bedSum += v.buf[v.pos++] * v.gain * bedDuck;
+      else {
+        const s = v.buf[v.pos++] * v.gain * bedDuck;
+        bedSum += s;
+        if (v.layer === "ambience") wetSum += s * AMBIENCE_SEND;
+      }
     }
-    block[i] = Math.tanh(bedSum + fxSum + room(wetSum) * REVERB_WET); // soft limiter: overlapping sounds never hard-clip
+    block[i] = Math.tanh(bedSum + fxSum + room(wetSum) * space.wet); // soft limiter: overlapping sounds never hard-clip
   }
   voices = voices.filter(v => (v.loop || v.pos < v.buf.length) && !(v.dieAtZero && v.gain === 0 && !v.fade));
   sent += want;
