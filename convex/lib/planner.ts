@@ -26,8 +26,18 @@ const words = (s: string) => s.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w
 // setting from the words it is given, and stays broad when they are vague (the live director narrows it down from the speech).
 const GROUNDING =
   "THE DESCRIPTION IS A PRIOR, NOT A SCRIPT. Infer the setting, tone and genre only from what it actually says; do not add plot elements, a genre or a music style that none of its words support. " +
-  "When it is short or vague, plan broadly useful sounds for the place and mood it does imply (ambience plus versatile effects) instead of committing to one imagined storyline: the live speech will decide the specifics. " +
+  "When it is short or vague, plan the concrete sound-making events TYPICAL of that kind of story (what people usually say happened in it) plus ambience, instead of committing to one imagined storyline: the live speech will decide the specifics. " +
   "Music moods are emotional feelings, not genres or settings.";
+
+// HOW TO WRITE A SOUND SO IT CAN BE FOUND, MADE AND TRIGGERED — shared by every planning call (setup and live rounds).
+// Rules only (the short examples show the FORMAT of a field): no theme is mapped to sounds in code, Claude decides per talk.
+const SOUND_WRITING = [
+  "HOW TO WRITE EACH SOUND:",
+  "- queries (3, tried in order until one finds files on Freesound): 1) how sound designers tag it, 2-3 words, noun + sound verb ('tent zipper', 'campfire crackle'); 2) a different common wording ('zip opening', 'fire burning'); 3) one or two broad words that surely exist ('zipper', 'fire'). No mood adjectives, story context, names or brands.",
+  "- gen_prompt (a sound generator uses it when the search fails): what is physically heard, one event, close and dry, no music, no voices, with how long or how many times ('A tent zipper pulled open in one quick motion, close').",
+  "- instant (2-4): short ways people SAY it is happening, present and past and the sound word itself ('zips the tent', 'unzipped', 'zip'; 'phone rang', 'ringing'; 'bang', 'beep beep'). Never a bare object or place ('the tent', 'the office').",
+  "- One distinct event per sound; no near-duplicates (one door knock, not three variations).",
+].join("\n");
 
 // LIVE DIRECTOR: during the talk each round is a decision, not a plan. The model sees the pre-talk prior, what was actually said,
 // the library and what is playing, and picks the best action (often: add nothing).
@@ -35,11 +45,14 @@ const LIVE_DIRECTOR = [
   "You are the live sound director of Syncopation, an app that enhances a real, unscripted speech with music, ambience and sound effects.",
   "Before the talk a library was planned from a short description: that is only a PRIOR. Now the speaker is talking and the message gives you the evidence: what was just said, what is already in the library (and what was played), what is playing right now, and the pre-talk plan.",
   "Decide the best action from the evidence, whatever the topic or genre turns out to be:",
-  "- If the library already covers what these words and the next few moments need, return an EMPTY sfx array. Adding nothing is often the right answer.",
+  "- YOUR MAIN JOB IS TO STAY ONE STEP AHEAD. Picture the scene the speaker just entered or announced (where they are, what they set out to do) and the ACTIONS that happen there that make a distinct sound and that the next sentences are likely to NAME. The library must have those BEFORE they are said: a sound fetched after the word is too late, so NEVER wait for an action to be named — 'not named yet' is exactly when to fetch it. When the speaker announces what someone set out to do, the sounds OF DOING it come next.",
+  "- So in most rounds add 1-4 sounds for those likely next actions, most likely first, plus any sound-making event the words just named that the library lacks (it may come up again).",
+  "- Return an EMPTY sfx array only when the speech is small talk / off-topic, or when the library already has a sound for EACH of the scene's likely next actions (a bed or a loosely related sound does not count). Never add quiet textures nobody names or near-duplicates of library sounds.",
   "- Otherwise return only the sounds that are MISSING: sounds the words name or imply, and sounds likely soon in the story AS TOLD. Weigh the prior and the speech as evidence: when they disagree, the speech wins; when the speech is ordinary, plan ordinary sounds whatever the prior suggested; when they agree, use the prior's sounds.",
   "- Add an ambience bed (id ending _ambience) only when the place changed or no existing bed fits where the speaker is.",
   "- Fill every metadata field so the sound MESHES with what is playing now: intensity, softness, emphasis, length_s, attack, tail. A sound that must sit inside the music and ambience is soft with a gentle attack and a longer tail; a hit that should cut through is sharp with an instant attack and a short tail; a pivotal moment gets high emphasis, a passing detail low.",
-  "- instant = phrases the speaker says when the sound is HAPPENING (never a bare noun or place). Queries are for Freesound text search: concrete nouns + verbs. Return at most 6 sounds, an empty music array and an empty voice array.",
+  SOUND_WRITING,
+  "- Return at most 6 sounds, an empty music array and an empty voice array.",
   "- Put one line in `read`: what the speech is actually about, how well the library fits it, and why you added what you added.",
 ].join("\n");
 
@@ -58,12 +71,12 @@ const PLAN_TOOL = {
           properties: {
             id: { type: "string", description: "snake_case id, e.g. door_creak" },
             label: { type: "string" },
-            queries: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 3, description: "2–4 word sound-library search phrases, best first" },
-            gen_prompt: { type: "string", description: "One-sentence prompt for a text-to-SFX model" },
+            queries: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 3, description: "3 Freesound searches tried in order: specific 2-3 words as sound designers tag it, another common wording, then 1-2 broad words" },
+            gen_prompt: { type: "string", description: "What is physically heard: one event, close and dry, no music or voices, how long / how many times" },
             safety: { type: "string", enum: ["speculative", "committed"], description: "speculative = risers, swells, drones, ambience that can fade out harmlessly; committed = discrete events (hits, creaks, knocks) that only make sense after their trigger word" },
             intensity: { type: "number", minimum: 0, maximum: 1, description: "how intense / energetic the sound itself is (a whisper-quiet creak 0.1, a crash 0.9)" },
             tags: { type: "array", items: { type: "string" }, maxItems: 8 },
-            instant: { type: "array", items: { type: "string" }, maxItems: 4, description: "phrases a speaker says when this sound is actually HAPPENING (verb or event, e.g. 'barks', 'doorbell rings'); never a bare noun or place" },
+            instant: { type: "array", items: { type: "string" }, maxItems: 4, description: "2-4 ways a speaker SAYS it is happening, present and past and the sound word ('barks', 'the dog barked', 'woof'); never a bare noun or place" },
             emphasis: { type: "number", minimum: 0, maximum: 1, description: "STORY WEIGHT of this event, not loudness: 0-0.3 incidental detail, 0.4-0.6 supporting moment, 0.7-1 a pivotal event the story turns on. The live mixer decides from the scene whether to soften or lift it." },
             softness: { type: "number", minimum: 0, maximum: 1, description: "the sound's own character: 0 = sharp, harsh transient (crash, bang, buzzer), 0.5 = ordinary, 1 = gentle and diffuse (rustle, murmur, pour, soft footsteps)" },
             length_s: { type: "number", minimum: 0.3, maximum: 4, description: "how long this sound should last in seconds: a click or knock 0.3-0.6, a door slam or ring 1-1.5, a swell, riser or rolling thunder 2-4" },
@@ -114,9 +127,14 @@ function systemPrompt(input: SetupInput, fast = 0): string {
     "You plan the OPENING of a small sound library for Syncopation, which adds music and sound effects under a live speaker.",
     GROUNDING,
     `Theme: ${input.theme}. Return exactly 2 music moods that fit (lowest intensity first; the first opens the talk) and exactly ${fast} SFX slots:`,
-    "the sounds most likely needed in the first 30 seconds, most likely first, plus one ambience bed (id containing 'ambience').",
-    "Every SFX has its own planned length (length_s, usually 0.3-2 s; up to 4 s only for a swell, riser or long event) except the ambience bed. Fill intensity, softness, length_s, attack and tail for each sound: they decide how it is searched, trimmed and faded in the mix. Queries are for Freesound text search: concrete nouns + verbs, no adjectives like 'scary'. Keep every field short.",
+    "plus one ambience bed (id containing 'ambience'), and as the rest the sounds the speaker is most likely to SAY OUT LOUD early in this kind of story, most likely first.",
+    "TURN THE ABSTRACT THEME INTO CONCRETE EVENTS. Method: 1) picture how people actually tell this kind of story out loud; 2) list the scenes it usually passes through; 3) in each scene, the ACTIONS people do or things that happen that make a distinct sound, and that the teller would NAME with a verb; 4) keep the ones most likely said early.",
+    "Pick distinct EVENTS with a clear sound, not quiet textures nobody mentions (cutlery clink, chair scrape, paper rustle) and not generic swells.",
+    "Every SFX has its own planned length (length_s, usually 0.3-2 s; up to 4 s only for a swell, riser or long event) except the ambience bed. Fill intensity, softness, length_s, attack and tail for each sound: they decide how it is searched, trimmed and faded in the mix. Keep every field short.",
+    SOUND_WRITING,
     "Voice layer is off: return an empty voice array.",
+    "MUSIC queries are an instrumental STYLE + instrument + mood (e.g. 'upbeat indie pop guitar', 'light funk groove', 'soft lofi piano'), never the story's events.",
+    "MUSIC TASTE: fun / funny / light talks get upbeat but tasteful modern music (indie pop, funk groove, light acoustic, lofi, light jazz), never cartoon, circus, kids, kazoo, slide-whistle or novelty music; serious talks get cinematic or ambient beds.",
   ].join("\n");
   return [
     "You plan a small sound library for Syncopation, which adds music and sound effects under a live speaker.",
@@ -131,10 +149,11 @@ function systemPrompt(input: SetupInput, fast = 0): string {
       ? "Also add SFX slots for sounds this kind of talk would plausibly need that the keywords miss (aim for 24-28 total), for ANY theme (comedy, nature, business, romance, sport...). Cover many situations the story could go through, with varied, concrete sounds: actions, objects, places, vehicles, weather, reactions, crowds."
       : "This is a quick follow-up round during the talk: return at most 8 SFX slots, only for the moments described, none that are already in the library.",
     input.layers.music ? "Include 2-3 speculative slots that fit the tone you infer (ambience beds, or gentle swells, drones or risers if they suit it) that can fade out harmlessly." : "",
-    "Queries are for Freesound text search: concrete nouns + verbs, no adjectives like 'scary'.",
+    SOUND_WRITING,
     "MUSIC queries are an instrumental STYLE + instrument + mood, never the story's events or places: 'upbeat acoustic guitar loop', 'tense pizzicato strings', 'soft lofi piano', 'playful ukulele', 'dark ambient pad'. A phrase like 'urgent hurry' or 'late for work' returns street recordings and alarms, not music. Everyday / lifestyle talks get light, modern music (lofi, acoustic, indie pop, light jazz).",
     "AMBIENCE beds loop for minutes: steady background only (room tone, cafe murmur, light traffic, rain), never one-off events (horns, sirens, alarms, announcements) in their queries.",
-    "ORDER MATTERS: list the SFX from most to least likely to be needed EARLY in the talk (the first 6 are fetched before the talk starts, the rest while it runs). List music moods from lowest to highest intensity; the first one opens the talk.",
+    "ORDER MATTERS: list the SFX from most to least likely to be NAMED by the speaker (concrete events with a verb: 'the doorbell rang', 'the dog barked', 'the glass shattered'), quiet textures last. List music moods from lowest to highest intensity; the first one opens the talk.",
+    "MUSIC TASTE: fun / funny / light talks get upbeat but tasteful modern music (indie pop, funk groove, light acoustic, lofi, light jazz), never cartoon, circus, kids, kazoo, slide-whistle or novelty music; serious talks get cinematic or ambient beds.",
     input.layers.voice
       ? "Voice layer is on: add up to 4 very short voice lines that fit the theme."
       : "Voice layer is off: return an empty voice array.",
@@ -192,7 +211,7 @@ function asArray(v: any): any[] {
   return v && typeof v === "object" ? [v] : [];
 }
 
-function fromToolInput(raw: any): LibraryPlan {
+export function fromToolInput(raw: any): LibraryPlan {
   const sfx: SfxSlot[] = asArray(raw.sfx).map((s: any) => ({
     kind: "sfx",
     id: slug(s.id ?? s.label),

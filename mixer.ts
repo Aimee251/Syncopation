@@ -104,7 +104,7 @@ export function setLevel(layer: "music" | "ambience", volume: number) {
 
 /** Speech is happening: dip the beds a little so the voice stays clear */
 export function duck(ms = 2500) { player.speaking(); if (mixerActive()) send({ type: "duck", ms }); }
-export { preload, pickCompatible, setMixLogger, soundProfile } from "./player";
+export { preload, pickCompatible, setMixLogger, soundProfile, setSpace } from "./player";
 
 export function stopAll() {
   if (mixerActive()) { send({ type: "stop" }); for (const k of Object.keys(state)) delete state[k]; }

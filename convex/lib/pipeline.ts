@@ -140,6 +140,11 @@ async function resolveSlot(slot: Slot, ctx: SlotCtx): Promise<ResolvedSound[]> {
   if (ctx.providers.choose && ranked.length > 1 && candidates[0]?.source !== "local") {
     const picked = await ctx.providers.choose(slot, ranked.slice(0, 8));
     if (picked.length) ranked = [...picked, ...ranked.filter((c) => !picked.includes(c))];
+    else if (slot.kind === "sfx") {
+      // Claude said none of the files IS this sound: generate it instead (the tag ranking is the fallback if that fails)
+      const g = await generateFor(slot, ctx);
+      if (g) { sayOnce(ctx, `gen-${slot.id}`, `${slot.id}: no search result fit → generated`); return [g]; }
+    }
   }
   const out: ResolvedSound[] = [];
   const tryGet = async (c: Candidate) => {
@@ -174,6 +179,11 @@ async function resolveSlot(slot: Slot, ctx: SlotCtx): Promise<ResolvedSound[]> {
 
 /** Provider health, shared across a run: stops us burning requests on a provider that is rate-limited or out of credits. */
 const health = { fsBlockedUntil: 0, fsBackoffMs: 60_000, genOutOfCredits: false, said: new Set<string>() };
+/** server.ts runs many talks in one process: a new talk starts with a clean slate (e.g. ElevenLabs re-enabled after a key fix) */
+export function resetProviderHealth() {
+  Object.assign(health, { fsBlockedUntil: 0, fsBackoffMs: 60_000, genOutOfCredits: false });
+  health.said.clear();
+}
 
 export function providerStatus() {
   const now = Date.now();

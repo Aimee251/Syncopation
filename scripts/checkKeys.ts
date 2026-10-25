@@ -35,6 +35,14 @@ await Promise.all([
     return { ok: false, detail: `HTTP ${res.status}: ${await body(res)}` };
   }),
   check("ElevenLabs (generated sounds)", env.ELEVENLABS_API_KEY, async () => {
+    // permission probe: an empty request is rejected as invalid (422) when the key may generate, and as 401 when it may not — no credits used
+    const probe = await fetch("https://api.elevenlabs.io/v1/sound-generation", { method: "POST", headers: { "xi-api-key": env.ELEVENLABS_API_KEY, "Content-Type": "application/json" }, body: "{}", signal: timeout(15000) });
+    if (probe.status === 401 || probe.status === 403) {
+      const t = await body(probe);
+      return { ok: false, detail: /permission/i.test(t)
+        ? "key is missing the Sound Effects permission → elevenlabs.io → Developers → API Keys → edit this key → set Sound Effects to Access (or make a new key with it on), paste it into .env"
+        : `key rejected (${probe.status}): ${t} — wrong key or extra spaces/quotes in .env` };
+    }
     const res = await fetch("https://api.elevenlabs.io/v1/user/subscription", { headers: { "xi-api-key": env.ELEVENLABS_API_KEY }, signal: timeout(15000) });
     if (!res.ok) {
       const t = await body(res);
