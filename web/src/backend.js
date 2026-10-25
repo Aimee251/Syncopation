@@ -48,8 +48,16 @@ export async function whenReady(id, onProgress) {
   }
 }
 
-/** Starts the live talk: the laptop's mic listens, sounds play from the laptop. */
-export const startTalk = (id, minutes) => post('talk', { id, minutes });
+/**
+ * Starts the live talk (sounds play from the laptop). Resolves with the micToken this page uses to stream its
+ * microphone to the talk (mic.js), or null when the backend listens to its own mic (--laptop-mic).
+ */
+export const startTalk = (id, minutes) => post('talk', { id, minutes }).then((j) => j.micToken ?? null);
+
+/** The microphone's WebSocket on the backend: same address as the API, ws(s) instead of http(s). */
+export const micUrl = () => base
+  ? `${base.replace(/^http/, 'ws')}/api/mic`
+  : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/api/mic`;
 
 /** Ends the talk (the report is printed in the backend terminal). */
 export const stopTalk = () => post('stop', {}).catch(() => {});

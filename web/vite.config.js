@@ -7,6 +7,7 @@ export default defineConfig(({ mode }) => ({
   // microphone on secure pages, and a plain http:// network address doesn't count.
   plugins: [react(), mode === 'phone' && basicSsl()],
   // Listen on the local network so the app can be opened on a phone.
-  // /api goes to the backend (server.ts in the repo root, started by `npm run app`).
-  server: { host: true, proxy: { '/api': 'http://localhost:8787' } },
+  // /api goes to the backend (server.ts in the repo root, started by `npm run app`), including the
+  // microphone's WebSocket (/api/mic).
+  server: { host: true, proxy: { '/api': { target: 'http://localhost:8787', ws: true } } },
 }));

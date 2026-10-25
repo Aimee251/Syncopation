@@ -5,6 +5,7 @@ import WaveGradient from './WaveGradient.jsx';
 import Wheel from './Wheel.jsx';
 import { listenSupported, useListen } from './useListen.js';
 import { startSession, startTalk, stopTalk, whenReady } from './backend.js';
+import { closeMic, streamMic } from './mic.js';
 
 // Layout from the mockup, in its 402×874 px.
 const BUTTON = { x: 201, y: 717 };
@@ -78,6 +79,15 @@ export default function Home() {
   // The current press-and-release: what was heard, and whether its bubble has started forming.
   const round = useRef(null);
   const listen = useListen();
+  // The talk listens to this phone's microphone (streamed to the backend); a note shows if that stops working.
+  const talkMic = useRef(null);
+  const [micNote, setMicNote] = useState('');
+  const endTalkMic = () => {
+    talkMic.current?.close();
+    talkMic.current = null;
+    closeMic();
+    setMicNote('');
+  };
 
   useEffect(() => {
     if (stage !== 'turning') return;
@@ -131,7 +141,14 @@ export default function Home() {
       const id = await session.current;
       setLoadStatus('Planning your sounds…');
       await whenReady(id, (n, total) => total && setLoadStatus(`Gathering sounds · ${n}/${total}`));
-      await startTalk(id, TALK_MINUTES);
+      const micToken = await startTalk(id, TALK_MINUTES);
+      // the talk hears this phone: stream the mic (opened on the hold-to-speak press) with the talk's token
+      if (micToken && round.current === r) {
+        const mic = streamMic({ mode: 'talk', token: micToken });
+        talkMic.current = mic;
+        mic.onError = (e) => { if (e && talkMic.current === mic) setMicNote(`${e.message} The talk can't hear you.`); };
+        mic.ready.catch((e) => { if (talkMic.current === mic) setMicNote(`${e.message} The talk can't hear you.`); });
+      }
     })();
     Promise.all([ready, minWait]).then(
       () => {
@@ -153,6 +170,7 @@ export default function Home() {
   // Something went wrong while loading: back to the start, ready to hold and speak again.
   const backHome = () => {
     endRound();
+    endTalkMic();
     session.current = null;
     setProgress(0);
     setDone(false);
@@ -183,6 +201,7 @@ export default function Home() {
   const reset = () => {
     if (stage !== 'turning') return;
     stopTalk();
+    endTalkMic();
     session.current = null;
     endRound();
     orbAnims.current.forEach((a) => a.cancel());
@@ -225,7 +244,8 @@ export default function Home() {
     );
     listen.stop().then((text) => {
       if (round.current !== r) return; // a newer press took over
-      r.text = text || NOTHING_HEARD;
+      r.text = text || listen.lastError() || NOTHING_HEARD;
+      if (!text) closeMic(); // nothing to go on: turn the mic off until the next press
       r.heard = Boolean(text);
       // The theme is in: planning and fetching start now, while the wheel is being turned.
       if (r.heard) {
@@ -330,6 +350,7 @@ export default function Home() {
       {(stage === 'turning' || stage === 'closing') && (
         <div className="turn-layer" onClick={reset}>
           <PageTurn story time={`${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`} />
+          {micNote && <p className="mic-note" role="alert">{micNote}</p>}
         </div>
       )}
 

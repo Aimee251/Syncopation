@@ -1466,6 +1466,21 @@ async function main() {
   vote("music", MOODS[0]);
 
   console.log(`\n${HELP}\n`);
+  // --remote-mic: started by server.ts for the web app. The microphone is the phone's (or any browser's): micServer.ts
+  // transcribes it and sends the words here over IPC, streaming like the local mic below (partial = the sentence so far)
+  if (process.argv.includes("--remote-mic") && process.send) {
+    onLine = line => { if (line.trim().startsWith("/")) command(line); };
+    queued.splice(0).forEach(onLine);
+    process.send({ op: "keyterms", terms: [...CUES.flatMap(s => [...(s.instant ?? []), ...s.tags]), ...STORY.keywords].filter(t => t.split(/\s+/).length <= 3) });
+    process.on("message", (m: any) => {
+      if (typeof m?.text !== "string" || !m.text.trim()) return;
+      const text = m.text.replace(/^\s*\/+/, ""); // spoken words are never commands
+      if (m.op === "partial") handlePartial(text, Number(m.lagMs) || 0).catch(() => { });
+      else if (m.op === "final") handleQueued(text);
+    });
+    console.log("Listening to the browser's microphone… (commands still work here)\n");
+    return;
+  }
   if (process.argv.includes("--type")) {
     console.log("Type the story one sentence at a time.\n");
     // --stream: replay each typed line word by word, like live streaming, to test early firing without a mic

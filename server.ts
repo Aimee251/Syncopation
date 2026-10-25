@@ -1,17 +1,22 @@
 // server.ts — connects the web app (web/) to the backend.
 //
 //   npm run app                    this server on :8787 + the web app on :5173 (open the URL Vite prints)
-//   npm run app -- --mic "Name"    use another microphone for the talk (names: npm run mics)
+//   npm run app -- --laptop-mic    the talk listens to THIS machine's mic instead of the browser's (old behaviour)
+//   npm run app -- --laptop-mic --mic "Name"    …and picks which one (names: npm run mics)
 //
 // Flow:
 //   1. hold & speak the theme → release → POST /api/start {theme}: planning + scraping start right away
+//      (the phrase is transcribed by the browser's mic stream on /api/mic, see micServer.ts)
 //   2. the user turns the wheel meanwhile; the loader polls GET /api/status?id=… until batch 1 is in
-//   3. POST /api/talk {id, minutes}: predict.ts runs the talk (laptop mic in, sounds out of the laptop);
+//   3. POST /api/talk {id, minutes}: predict.ts runs the talk and answers with a micToken; the page streams its
+//      microphone to /api/mic with it and the words go to predict.ts as they're heard (sounds out of this machine);
 //      batch 2 and the live top-ups keep loading inside predict.ts, like with `npm run dev`
 //   4. tap the page → POST /api/stop: sends /end (report printed here, learned weights saved)
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { attachMic } from "./micServer";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { extname, join, resolve } from "node:path";
 import { buildSoundLibrary, startPlans } from "./scripts/buildLibrary";
@@ -66,24 +71,36 @@ if (process.platform === "darwin" && !process.env.MIC_DEVICE &&
   spawnSync("sox", ["-q", "-t", "coreaudio", "MacBook Pro Microphone", "-n", "trim", "0", "0.1"], { stdio: "ignore" }).status === 0)
   process.env.MIC_DEVICE = "MacBook Pro Microphone";
 
-// 3. the talk itself
-function startTalk(job: Job, minutes: number) {
+// 3. the talk itself. By default it hears the BROWSER's microphone (any phone): the page streams it to /api/mic with
+//    this talk's token. --laptop-mic keeps the old behaviour (sox on this machine).
+const LAPTOP_MIC = process.argv.includes("--laptop-mic");
+let talkToken: string | null = null;    // proves a mic stream belongs to the running talk
+let keyterms: string[] = [];            // the talk's trigger words, sent by predict.ts, for the speech model
+function startTalk(job: Job, minutes: number): string | null {
   stopTalk();
   writeFileSync(join(job.dir, "setup.json"), JSON.stringify({
     summary: job.theme, keywords: [], tone: "follow the story", density: "expressive", minutes, theme: job.theme, layers,
   }, null, 2));
-  console.log(`[app] talk started (${minutes} min, mic: ${process.env.MIC_DEVICE || "system default"})`);
-  const child = spawn(join("node_modules", ".bin", "tsx"),
-    ["--env-file=.env", "predict.ts", "--library", join(job.dir, "library.json"), "--setup", join(job.dir, "setup.json")],
-    { stdio: ["pipe", "inherit", "inherit"] });
-  child.on("exit", () => { if (talk === child) talk = null; });
+  console.log(`[app] talk started (${minutes} min, mic: ${LAPTOP_MIC ? process.env.MIC_DEVICE || "this machine's default" : "the browser's"})`);
+  // node + tsx directly (not node_modules/.bin/tsx): keeps the IPC channel to this process, and works on Windows too.
+  // API keys come from this process's environment (npm run app loads .env).
+  const child = spawn(process.execPath,
+    ["--import", "tsx", "predict.ts", "--library", join(job.dir, "library.json"), "--setup", join(job.dir, "setup.json"), ...(LAPTOP_MIC ? [] : ["--remote-mic"])],
+    { stdio: ["pipe", "inherit", "inherit", "ipc"] });
+  child.on("message", (m: any) => {
+    if (m?.op === "keyterms" && Array.isArray(m.terms)) keyterms = m.terms.filter((t: unknown) => typeof t === "string" && t.length <= 60).slice(0, 200);
+  });
+  child.on("exit", () => { if (talk === child) { talk = null; talkToken = null; } });
   talk = child;
+  keyterms = [];
+  talkToken = LAPTOP_MIC ? null : randomBytes(24).toString("base64url");
+  return talkToken;
 }
 // 4. /end prints the report and saves the weights; Ctrl+C-style stop if it hangs
 function stopTalk() {
   const child = talk;
   if (!child) return;
-  talk = null;
+  talk = null; talkToken = null;
   child.stdin?.write("/end\n");
   setTimeout(() => child.kill("SIGINT"), 5000).unref();
 }
@@ -104,7 +121,7 @@ const readBody = (req: IncomingMessage) => new Promise<any>(resolve => {
   req.on("end", () => { try { resolve(JSON.parse(s || "{}")); } catch { resolve({}); } });
 });
 
-createServer(async (req, res) => {
+const server = createServer(async (req, res) => {
   const url = new URL(req.url || "/", "http://x");
   if (req.method === "OPTIONS") { res.writeHead(204, CORS); return res.end(); }
   try {
@@ -122,8 +139,8 @@ createServer(async (req, res) => {
       const { id, minutes } = await readBody(req);
       const job = jobs.get(id);
       if (!job || job.state !== "ready") return send(res, 409, { error: "library not ready" });
-      startTalk(job, Number(minutes) || 3);
-      return send(res, 200, { ok: true });
+      const micToken = startTalk(job, Number(minutes) || 3);
+      return send(res, 200, { ok: true, micToken });   // null with --laptop-mic: the page then doesn't stream
     }
     if (req.method === "POST" && url.pathname === "/api/stop") {
       stopTalk();
@@ -135,7 +152,15 @@ createServer(async (req, res) => {
   } catch (e) {
     send(res, 500, { error: e instanceof Error ? e.message : String(e) });
   }
-}).listen(PORT, () => console.log(`[app] backend on http://localhost:${PORT}`));
+});
+// the browser's microphone (WebSocket /api/mic): theme phrases, and the talk's words into predict.ts
+attachMic(server, {
+  token: () => talkToken,
+  keyterms: () => keyterms,
+  hear: (op, text) => { if (talk?.connected) talk.send({ op, text: text.slice(0, 1000) }); },
+});
+if (!LAPTOP_MIC && !process.env.DEEPGRAM_API_KEY) console.log("[app] note: no DEEPGRAM_API_KEY — the browser's microphone can't be transcribed (add it to .env, or run with --laptop-mic)");
+server.listen(PORT, () => console.log(`[app] backend on http://localhost:${PORT}`));
 
 // the web app (Vite) in the same terminal; /api is proxied to this server (web/vite.config.js)
 let web: ChildProcess | null = null;

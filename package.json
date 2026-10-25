@@ -10,14 +10,17 @@
     "mic": "tsx --env-file=.env predict.ts",
     "type": "tsx --env-file=.env predict.ts --type",
     "keys": "tsx --env-file=.env scripts/checkKeys.ts",
-    "mics": "tsx scripts/listMics.ts"
+    "mics": "tsx scripts/listMics.ts",
+    "test:mic": "tsx --test tests/mic.test.ts"
   },
   "dependencies": {
-    "@huggingface/transformers": "^3.0.0"
+    "@huggingface/transformers": "^3.0.0",
+    "ws": "^8.22.0"
   },
   "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.2",
     "tsx": "^4.19.0",
-    "typescript": "^5.5.0",
-    "@types/node": "^22.0.0"
+    "typescript": "^5.5.0"
   }
 }

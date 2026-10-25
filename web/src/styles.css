@@ -606,6 +606,23 @@ body,
   pointer-events: none;
   animation: fade-out 400ms ease both;
 }
+/* Shown over the page-turn screen when the talk can't hear this phone's microphone. */
+.mic-note {
+  position: absolute;
+  left: 50%;
+  bottom: max(24px, env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  width: min(320px, calc(100% - 32px));
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: 14px;
+  background: rgba(20, 20, 20, 0.82);
+  color: #fff;
+  font-size: 13px;
+  line-height: 1.4;
+  text-align: center;
+  animation: fade-in 400ms ease both;
+}
 @keyframes fade-in {
   from { opacity: 0; }
 }
