@@ -32,7 +32,9 @@ export function setMixLogger(fn: (msg: string) => void) { log = fn; }
 const dbToGain = (db: number) => Math.pow(10, db / 20);
 // MIX LEVELS (dB). Effects sit clearly ON TOP of the music: beds are normalised 10 dB below effects and dip a further
 // 9 dB the moment an effect hits. Tune without code: MIX_BED_DB=-22 MIX_FX_DB=-10 MIX_FX_DUCK_DB=-9 npm run dev
-const BED_DB = Number(process.env.MIX_BED_DB ?? -21);      // music + ambience loudness (was -16)
+// was -21: with effects placed RELATIVE to the music, a quiet bed made the whole output quiet (music ~-38 dB, effects
+// ~-29 dB in a render: near-silent on laptop speakers). -15 puts music around -25 dB and effects at -23..-13 dB.
+const BED_DB = Number(process.env.MIX_BED_DB ?? -15);      // music + ambience loudness
 const FX_DB = Number(process.env.MIX_FX_DB ?? -11);        // instant sound loudness (was -12)
 const FX_DUCK_DB = Number(process.env.MIX_FX_DUCK_DB ?? -9); // extra dip of the beds under each effect (was -4)
 
@@ -227,7 +229,15 @@ function prepare(file: string, kind: "fx" | "bed") {
   const rmsNow = Math.sqrt(sum / x.length) || 1e-6;
   const g = Math.min(dbToGain(kind === "fx" ? FX_DB : BED_DB) / rmsNow, 0.95 / (peak || 1));
   const prof = kind === "fx" ? profile(x, rmsNow, peak || 1e-6, g) : undefined; // measured before scaling
-  for (let i = 0; i < x.length; i++) x[i] *= g;
+  if (kind === "bed") {
+    // BEDS reach their loudness target even when a few peaks would clip: the gain is set from the average level, and only
+    // the peaks above 0.7 are rounded off (soft limiting). Before, peak-capped scaling left peaky music ~15 dB under target.
+    const gb = dbToGain(BED_DB) / rmsNow, knee = 0.7;
+    for (let i = 0; i < x.length; i++) {
+      const v = x[i] * gb, a = Math.abs(v);
+      x[i] = a <= knee ? v : Math.sign(v) * (knee + (0.98 - knee) * Math.tanh((a - knee) / (0.98 - knee)));
+    }
+  } else for (let i = 0; i < x.length; i++) x[i] *= g;
   if (kind === "fx") { // soft attack (no click, no harsh onset) and a natural-length release
     const fi = Math.round(0.008 * SR), fo = Math.min(Math.round(0.12 * SR), x.length >> 1);
     for (let i = 0; i < fi && i < x.length; i++) x[i] *= i / fi;

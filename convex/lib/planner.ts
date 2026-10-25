@@ -132,6 +132,8 @@ function systemPrompt(input: SetupInput, fast = 0): string {
       : "This is a quick follow-up round during the talk: return at most 8 SFX slots, only for the moments described, none that are already in the library.",
     input.layers.music ? "Include 2-3 speculative slots that fit the tone you infer (ambience beds, or gentle swells, drones or risers if they suit it) that can fade out harmlessly." : "",
     "Queries are for Freesound text search: concrete nouns + verbs, no adjectives like 'scary'.",
+    "MUSIC queries are an instrumental STYLE + instrument + mood, never the story's events or places: 'upbeat acoustic guitar loop', 'tense pizzicato strings', 'soft lofi piano', 'playful ukulele', 'dark ambient pad'. A phrase like 'urgent hurry' or 'late for work' returns street recordings and alarms, not music. Everyday / lifestyle talks get light, modern music (lofi, acoustic, indie pop, light jazz).",
+    "AMBIENCE beds loop for minutes: steady background only (room tone, cafe murmur, light traffic, rain), never one-off events (horns, sirens, alarms, announcements) in their queries.",
     "ORDER MATTERS: list the SFX from most to least likely to be needed EARLY in the talk (the first 6 are fetched before the talk starts, the rest while it runs). List music moods from lowest to highest intensity; the first one opens the talk.",
     input.layers.voice
       ? "Voice layer is on: add up to 4 very short voice lines that fit the theme."

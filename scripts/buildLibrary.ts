@@ -10,12 +10,14 @@
 // Also importable: cli.ts calls buildSoundLibrary() with the answers from its setup questions.
 
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { join, resolve } from "node:path";
 import { fallbackPlan, planWithClaude } from "../convex/lib/planner";
 import { DEFAULT_OPTS, providerStatus, runPipeline, type PipelineOpts } from "../convex/lib/pipeline";
 import { providersFromEnv } from "../convex/lib/providersFromEnv";
-import type { LibraryPlan, ProgressEvent, SetupInput, SoundRecord } from "../convex/lib/types";
+import type { Candidate, LibraryPlan, MusicSlot, ProgressEvent, SetupInput, SfxSlot, SoundRecord } from "../convex/lib/types";
+import type { Providers } from "../convex/lib/pipeline";
 
 const args = process.argv.slice(2);
 const flag = (name: string) => args.includes(`--${name}`);
@@ -30,6 +32,151 @@ const cleanEnv = () => {
   if (e.APIFY_ENABLE !== "1") delete e.APIFY_TOKEN; // the actor returns HTTP 403 for this token: don't spend a request per sound on it
   return e;
 };
+
+// ------------------------------------------------------------------------------------------- QUOTA + CLAUDE CHOOSES
+// Freesound: ~60 searches/min and ~2000/day per key. ElevenLabs: monthly credits. A session used to spend 200+ searches
+// and an ElevenLabs generation per effect. Now:
+//   · searches are paced (freesound.ts) and remembered for a day (.cache/freesound): the SAME phrase Claude wrote isn't
+//     searched twice — the phrases still come from Claude for every theme, nothing is hardcoded
+//   · a daily counter (.cache/usage.json) shows how much of the 2000 is used (npm run keys)
+//   · ElevenLabs credits are checked once; with none left, generation is skipped instead of failing per sound
+//   · CLAUDE picks the file from the search results (names, tags, length) for the background batches, and when nothing
+//     is found online CLAUDE decides whether a sound from an earlier session genuinely fits — or leaves the slot empty
+const CACHE = ".cache";
+const themeOf = (dir: string) => { try { return JSON.parse(readFileSync(join(dir, "library.json"), "utf8")).theme ?? ""; } catch { return ""; } };
+const sha = (x: string) => createHash("sha1").update(x).digest("hex").slice(0, 20);
+const today = () => new Date().toISOString().slice(0, 10);
+export function usageToday(): { date: string; freesound: number } {
+  try { const u = JSON.parse(readFileSync(join(CACHE, "usage.json"), "utf8")); if (u.date === today()) return u; } catch { }
+  return { date: today(), freesound: 0 };
+}
+function countSearch() {
+  const u = usageToday(); u.freesound++;
+  try { mkdirSync(CACHE, { recursive: true }); writeFileSync(join(CACHE, "usage.json"), JSON.stringify(u)); } catch { }
+  if (u.freesound === 1600) console.warn("Freesound: 1600 of ~2000 searches used today — a 2nd FREESOUND_API_KEY would help");
+}
+
+// one Claude call for several sounds at once: requests arriving within 400 ms are answered together
+function batcher<T, R>(run: (items: T[]) => Promise<R[]>, waitMs = 400, max = 10) {
+  let queue: { item: T; resolve: (r: R) => void }[] = [], timer: ReturnType<typeof setTimeout> | null = null;
+  const flush = async () => {
+    const items = queue; queue = []; timer = null;
+    let out: R[] = [];
+    try { out = await run(items.map((q) => q.item)); } catch { }
+    items.forEach((q, i) => q.resolve(out[i] as R));
+  };
+  return (item: T) => new Promise<R>((resolve) => {
+    queue.push({ item, resolve });
+    if (queue.length >= max) { if (timer) clearTimeout(timer); flush(); } else if (!timer) timer = setTimeout(flush, waitMs);
+  });
+}
+async function askClaude(env: Record<string, string>, system: string, user: string, schema: any): Promise<any> {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "x-api-key": env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+    body: JSON.stringify({ model: env.CLAUDE_MODEL || "claude-haiku-5-5", max_tokens: 1500, system,
+      tools: [{ name: "pick", description: "Your picks", input_schema: schema }], tool_choice: { type: "tool", name: "pick" },
+      messages: [{ role: "user", content: user }] }),
+  });
+  if (!res.ok) throw new Error(`Claude HTTP ${res.status}`);
+  const data: any = await res.json();
+  return data.content?.find((c: any) => c.type === "tool_use")?.input;
+}
+const PICK_SCHEMA = { type: "object", required: ["picks"], properties: { picks: { type: "array", items: { type: "object", required: ["id", "choice"],
+  properties: { id: { type: "string" }, choice: { type: "array", items: { type: "integer" }, maxItems: 2, description: "indexes of the fitting files, best first; [] if none fits" } } } } } };
+const describe = (slot: SfxSlot | MusicSlot) => slot.kind === "music"
+  ? `music for the mood "${slot.mood}" (${slot.tags.slice(0, 5).join(", ")})`
+  : `sound effect "${slot.label}" (${slot.tags.slice(0, 5).join(", ")}; ${slot.maxDurationS >= 10 ? "a steady background loop" : `a one-off sound, up to ${slot.maxDurationS} s`})`;
+
+// sounds already on this machine, for Claude's reuse decision
+type LocalRec = Candidate & { layer: string; loop: boolean };
+let localIndex: LocalRec[] | null = null;
+function buildLocalIndex(): LocalRec[] {
+  const out: LocalRec[] = [], seen = new Set<string>();
+  const dirs = [...(existsSync("sessions") ? readdirSync("sessions").map((d) => join("sessions", d)) : []), "public"];
+  for (const dir of dirs) {
+    let lib: any;
+    try { lib = JSON.parse(readFileSync(join(dir, "library.json"), "utf8")); } catch { continue; }
+    for (const r of lib.sounds ?? []) {
+      const file = resolve(dir, String(r.url ?? "").replace(/^\//, ""));
+      if (!r.url || seen.has(String(r.slotId) + r.layer) || !existsSync(file)) continue; // one file per kind of sound
+      seen.add(String(r.slotId) + r.layer);
+      out.push({ source: "local", sourceId: file, name: String(r.label ?? r.slotId), tags: (r.tags ?? []).slice(0, 6), durationS: (r.durationMs ?? 0) / 1000,
+        audioUrl: "file://" + file, license: r.license ?? "unknown", attribution: r.attribution, pageUrl: r.pageUrl, layer: r.layer, loop: !!r.loop });
+    }
+  }
+  return out;
+}
+
+export function withQuotaAndClaude<T extends { providers: Providers; enabled: string[] }>(r: T, outDir: string, theme: string, claudeChooses: boolean | "beds"): T {
+  const env = cleanEnv();
+  const p = { ...r.providers };
+  const own = resolve(outDir);
+  // remembered searches + daily counter
+  if (p.freesound) {
+    const search = p.freesound;
+    p.freesound = async (q, o) => {
+      const file = join(CACHE, "freesound", sha(q + JSON.stringify(o)) + ".json");
+      try { const c = JSON.parse(readFileSync(file, "utf8")); if (Date.now() - c.at < 86_400_000) return c.results; } catch { }
+      countSearch();
+      const results = await search(q, o);
+      try { mkdirSync(join(CACHE, "freesound"), { recursive: true }); writeFileSync(file, JSON.stringify({ at: Date.now(), results })); } catch { }
+      return results;
+    };
+  }
+  // ElevenLabs: check credits ONCE; with none left, don't ask per sound
+  if ((p.genSfx || p.genMusic) && env.ELEVENLABS_API_KEY) {
+    const credits = fetch("https://api.elevenlabs.io/v1/user/subscription", { headers: { "xi-api-key": env.ELEVENLABS_API_KEY }, signal: AbortSignal.timeout(5000) })
+      .then(async (res) => { if (!res.ok) return Infinity; const s: any = await res.json(); return Number(s.character_limit ?? 0) - Number(s.character_count ?? 0); })
+      .catch(() => Infinity);
+    let warned = false;
+    const gate = <F extends (...a: any[]) => Promise<any>>(fn?: F) => fn && (async (...a: any[]) => {
+      if ((await credits) <= 0) { if (!warned) { warned = true; console.warn("ElevenLabs: no credits left — sounds are searched only (no generation) until it resets"); } throw new Error("ElevenLabs out of credits"); }
+      return fn(...a);
+    }) as F;
+    p.genSfx = gate(p.genSfx); p.genMusic = gate(p.genMusic);
+  }
+  if (env.ANTHROPIC_API_KEY) {
+    if (claudeChooses) {
+      const choose = batcher<{ slot: SfxSlot | MusicSlot; cands: Candidate[] }, Candidate[]>(async (items) => {
+        const user = `Live talk: "${theme}". For each sound, pick the file(s) that ARE the intended sound (not something else with similar words, ` +
+          `no voices/music in an effect, no one-off events in a background loop). [] if none fits.\n\n` +
+          items.map((it) => `id ${it.slot.id}: ${describe(it.slot)}\n` + it.cands.map((c, i) => `  ${i}. "${c.name}" [${c.tags.slice(0, 6).join(", ")}] ${c.durationS.toFixed(1)} s${c.rating ? `, rated ${c.rating.toFixed(1)}` : ""}`).join("\n")).join("\n\n");
+        const out = await askClaude(env, "You choose sound files for a live sound designer. Be strict: the file must sound like the described sound.", user, PICK_SCHEMA);
+        return items.map((it) => {
+          const pick = (out?.picks ?? []).find((x: any) => x.id === it.slot.id);
+          return pick ? (pick.choice as number[]).map((i) => it.cands[i]).filter(Boolean) : it.cands; // no answer: keep the tag ranking
+        });
+      });
+      const isBedSlot = (slot: SfxSlot | MusicSlot) => slot.kind === "music" || slot.maxDurationS >= 10 || /ambien|atmos|drone|room_?tone|bed/i.test(slot.id);
+      p.choose = (slot, cands) => (claudeChooses === "beds" && !isBedSlot(slot) ? Promise.resolve(cands) : choose({ slot, cands }));
+    }
+    const reuse = batcher<SfxSlot | MusicSlot, Candidate[]>(async (slots) => {
+      localIndex ??= buildLocalIndex();
+      const bed = (s: SfxSlot | MusicSlot) => s.kind === "sfx" && (s.maxDurationS >= 10 || /ambien|atmos|drone|room_?tone|bed/i.test(s.id)); // "rain_ambience_cafe" is a loop
+      const kinds = (s: SfxSlot | MusicSlot) => (c: LocalRec) => !c.sourceId.startsWith(own) && (s.kind === "music" ? c.layer === "music" : bed(s) ? c.loop && c.layer !== "music" : c.layer === "sfx" && !c.loop);
+      // up to 60 files of EACH kind that is needed (music / background loops / one-off effects), so no kind is cut off
+      const pool: LocalRec[] = [];
+      for (const s of slots) for (const c of localIndex.filter(kinds(s))) if (!pool.includes(c) && pool.filter(kinds(s)).length < 60) pool.push(c);
+      if (!pool.length) return slots.map(() => []);
+      const user = `Live talk: "${theme}". The online sound search found nothing for the sounds below. These files from earlier talks are on this machine:\n` +
+        pool.map((c, i) => `  ${i}. ${c.layer}${c.loop ? " loop" : ""}: "${c.name}" [${c.tags.join(", ")}]`).join("\n") +
+        `\n\nFor each needed sound, pick a file ONLY if it genuinely works as that sound in this talk (right kind: music for music, a loop for a background, a one-off for an effect). [] otherwise.\n` +
+        slots.map((s) => `id ${s.id}: ${describe(s)}`).join("\n");
+      const out = await askClaude(env, "You reuse sound files for a live sound designer. Never force a bad fit: silence is better than a wrong sound.", user, PICK_SCHEMA);
+      return slots.map((s) => {
+        const pick = (out?.picks ?? []).find((x: any) => x.id === s.id);
+        return (pick?.choice ?? []).map((i: number) => pool[i]).filter((c: LocalRec | undefined) => c && kinds(s)(c));
+      });
+    });
+    p.reuse = (slot) => reuse(slot);
+  }
+  const download = p.download;
+  p.download = (url: string) => url.startsWith("file://")
+    ? readFile(url.slice(7)).then((b) => ({ bytes: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer, contentType: url.endsWith(".wav") ? "audio/wav" : url.endsWith(".ogg") ? "audio/ogg" : "audio/mpeg" }))
+    : download(url);
+  return { ...r, providers: p };
+}
 
 /** Plan with Claude, retrying transient network errors (e.g. "fetch failed") before giving up. */
 async function planRetry(input: SetupInput, key: string, model: string): Promise<LibraryPlan> {
@@ -118,7 +265,7 @@ export async function buildSoundLibrary(
     console.log(`Batch 1 now: ${plan.music.length} music + ${plan.sfx.length} sfx · batch 2 while you talk`);
   }
 
-  const { providers, enabled } = providersFromEnv(env);
+  const { providers, enabled } = withQuotaAndClaude(providersFromEnv(env), outDir, input.prompt || input.theme, firstBatch === 0 ? true : "beds"); // batch 1: Claude picks the music + background (heard all the time); effects keep the fast ranking
   console.log(`Providers: ${enabled.join(", ") || "none"}`);
   if (!providers.freesound && !providers.apify && !providers.genSfx) throw new Error("Set FREESOUND_API_KEY (or APIFY_TOKEN / ELEVENLABS_API_KEY)");
 
@@ -182,11 +329,13 @@ const firstBatchGenerate = "fallback"; // batch 2: search only, ElevenLabs just 
  * BATCH 2: fetches what buildSoundLibrary(firstBatch) left in pending.json, appends it to library.json and
  * removes pending.json. Called by predict.ts in the background once the talk has started.
  */
-export async function finishLibrary(outDir: string, opts: PipelineOpts = { ...DEFAULT_OPTS, variants: 2, concurrency: 3, budgetMs: 120_000 }) {
+export async function finishLibrary(outDir: string, opts: PipelineOpts = { ...DEFAULT_OPTS, variants: 2, concurrency: 3, budgetMs: 120_000 },
+  onSound?: (rec: SoundRecord & { url: string }) => void | Promise<void>, // each sound the moment it's saved (it can play right away)
+) {
   const pendingPath = join(outDir, "pending.json");
   if (!existsSync(pendingPath)) return [];
   const { plan, generate } = JSON.parse(await readFile(pendingPath, "utf8")) as { plan: LibraryPlan; generate?: PipelineOpts["generate"] };
-  const { providers } = providersFromEnv(cleanEnv());
+  const { providers } = withQuotaAndClaude(providersFromEnv(cleanEnv()), outDir, themeOf(outDir), true);
   await mkdir(join(outDir, "sounds"), { recursive: true });
   const fresh: Array<SoundRecord & { url: string }> = [];
   await runPipeline(plan, providers, {
@@ -194,20 +343,31 @@ export async function finishLibrary(outDir: string, opts: PipelineOpts = { ...DE
       const ext = sound.contentType.includes("ogg") ? "ogg" : sound.contentType.includes("wav") ? "wav" : "mp3";
       const file = `sounds/${record.id.replace("#", "_")}.${ext}`;
       await writeFile(join(outDir, file), Buffer.from(sound.bytes));
-      fresh.push({ ...record, url: `/${file}` });
+      const rec = { ...record, url: `/${file}` };
+      fresh.push(rec);
+      await onSound?.(rec);
     },
   }, () => { }, { ...opts, generate: generate ?? opts.generate });
-  try {
+  await appendToLibrary(outDir, fresh, plan.music.map((m) => m.mood));
+  await rm(pendingPath, { force: true });
+  return fresh;
+}
+
+// library.json is written by batch 2 AND the live rounds, which now run at the same time: one write at a time
+let libWrite: Promise<unknown> = Promise.resolve();
+function appendToLibrary(outDir: string, fresh: Array<SoundRecord & { url: string }>, moods: string[] = []) {
+  const job = libWrite.then(async () => {
     const path = join(outDir, "library.json");
     const lib = JSON.parse(await readFile(path, "utf8"));
-    lib.sounds.push(...fresh);
-    lib.moods = [...new Set([...(lib.moods ?? []), ...plan.music.map((m) => m.mood)])];
+    const ids = new Set(lib.sounds.map((r: SoundRecord) => r.id));
+    lib.sounds.push(...fresh.filter((r) => !ids.has(r.id)));
+    lib.moods = [...new Set([...(lib.moods ?? []), ...moods])];
     lib.sfxIds = [...new Set([...(lib.sfxIds ?? []), ...fresh.filter((r) => r.layer === "sfx").map((r) => r.slotId)])];
     lib.voiceIds = [...new Set([...(lib.voiceIds ?? []), ...fresh.filter((r) => r.layer === "voice").map((r) => r.slotId)])];
     await writeFile(path, JSON.stringify(lib, null, 2));
-  } catch { /* the new sounds still work for this run */ }
-  await rm(pendingPath, { force: true });
-  return fresh;
+  }).catch(() => { /* library.json missing: the new sounds still work for this run */ });
+  libWrite = job;
+  return job;
 }
 
 /**
@@ -237,7 +397,7 @@ export async function expandLibrary(
   plan.sfx = plan.sfx.filter((s) => !existingIds.has(s.id));
   plan.music = []; plan.voice = [];
   if (!plan.sfx.length) return [];
-  const { providers } = providersFromEnv(env);
+  const { providers } = withQuotaAndClaude(providersFromEnv(env), outDir, prompt, true);
   await mkdir(join(outDir, "sounds"), { recursive: true });
   const fresh: Array<SoundRecord & { url: string }> = [];
   await runPipeline(plan, providers, {
@@ -248,14 +408,7 @@ export async function expandLibrary(
       fresh.push({ ...record, url: `/${file}` });
     },
   }, () => { }, opts);
-  // append to library.json so the next run of the same session has them too
-  try {
-    const path = join(outDir, "library.json");
-    const lib = JSON.parse(await readFile(path, "utf8"));
-    lib.sounds.push(...fresh);
-    lib.sfxIds = [...new Set([...(lib.sfxIds ?? []), ...fresh.map((r) => r.slotId)])];
-    await writeFile(path, JSON.stringify(lib, null, 2));
-  } catch { /* library.json missing: the new sounds still work for this run */ }
+  await appendToLibrary(outDir, fresh); // so the next run of the same session has them too
   return fresh;
 }
 

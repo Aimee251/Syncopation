@@ -52,7 +52,16 @@ function startBed(name: "music" | "ambience", s?: Sound) {
 }
 process.on("exit", stopAll);
 // End of talk: music and ambience fade out (~0.5 s) instead of cutting off, then quit
-const fadeOutAndExit = () => { stopAll(); setTimeout(() => process.exit(0), 1000); };
+// The embedding model (onnxruntime) must be released before exit, or macOS aborts with
+// "libc++abi … mutex lock failed: Invalid argument" after the report.
+const fadeOutAndExit = () => {
+  stopAll();
+  const release = Promise.race([Promise.resolve(embedder?.dispose?.()).catch(() => {}), new Promise(r => setTimeout(r, 800))]);
+  setTimeout(() => release.then(() => process.exit(0)), 1000);
+};
+// /end and Ctrl+C both land here; the report is printed once
+let ended = false;
+function endTalk() { if (ended) return; ended = true; printTimeline(); saveWeights(); fadeOutAndExit(); }
 const DEMO_LIBRARY: Sound[] = [
   { id: "door_creak", role: "sfx", tags: ["door", "creak", "open"], intensity: 0.6 },
   { id: "footsteps_wood", role: "sfx", tags: ["footsteps", "steps", "walking", "stairs"], intensity: 0.5 },
@@ -809,6 +818,8 @@ function vote(name: "music" | "ambience", value: string) {
   // nothing playing yet → start now (never leave the talk without music); later switches need 2 votes
   if (L.n < 2 && L.now) return say(C.music, "MUSIC", `${name} leaning ${value} (1/2)`);
   const found = LIBRARY.find(s => (name === "music" ? s.mood : s.setting) === value);
+  // no file for it (yet): keep what's playing instead of "switching" to nothing (the "(undefined)" lines)
+  if (!found?.files?.length) { L.vote = ""; L.n = 0; return; }
   const sound = found?.id;
   const verb = L.now ? "SWITCH" : "START";
   L.now = value; L.vote = ""; L.n = 0;
@@ -882,11 +893,14 @@ function treatment(r: Cand, volScale = 1) {
   presence = Math.max(0, Math.min(1, presence));
   // softening grows when the sound should sit back or is gentle by nature
   const soften = Math.max(0, Math.min(1, 0.55 * (1 - presence) + 0.45 * softnessOf(r.s)));
-  const lowpassHz = soften < 0.3 ? undefined : Math.round(Math.exp(Math.log(16000) + (Math.log(2500) - Math.log(16000)) * ((soften - 0.3) / 0.7)));
+  // softening never goes below 4 kHz: at 2.5 kHz a sound under a live voice turned into a dull thud nobody noticed
+  const lowpassHz = soften < 0.3 ? undefined : Math.round(Math.exp(Math.log(16000) + (Math.log(4000) - Math.log(16000)) * ((soften - 0.3) / 0.7)));
   return {
     presence, soften, lowpassHz,
-    liftDb: -4 + 14 * presence,
-    wet: 0.6 + 1.4 * soften,
+    // always at least a little IN FRONT of the music (+2 … +12 dB): "tucked under" (down to -4 dB) plus the voice on
+    // top made effects inaudible. Sitting back is done by softening and room, not by burying it.
+    liftDb: 2 + 10 * presence,
+    wet: 0.5 + 0.8 * soften,
     // fades: the planner decided how this sound starts (attack) and ends (tail); the scene's softening is blended in so a
     // sound that has to sit back also eases in and dissolves out, and a hard hit in a tense scene keeps its natural edge
     attackMs: Math.round(r.s.attack !== undefined ? 0.65 * (8 + r.s.attack ** 2 * 600) + 0.35 * (8 + soften * soften * 120) : 8 + soften * soften * 120),
@@ -1187,14 +1201,14 @@ async function handle(text: string, arrived = Date.now()) {
 }
 
 // Adds freshly scraped records to the running talk: library, Claude's options, mixer, trigger phrases
-async function mergeSounds(fresh: any[], dir: string): Promise<Sound[]> {
+async function mergeSounds(fresh: any[], dir: string, prep = true): Promise<Sound[]> {
   const added = toSounds(fresh, dir).filter(s => !LIBRARY.some(x => x.id === s.id));
   for (const s of toSounds(fresh, dir)) { const old = LIBRARY.find(x => x.id === s.id); if (old) old.files = [...new Set([...(old.files ?? []), ...(s.files ?? [])])]; }
   if (!added.length) return [];
   LIBRARY.push(...added);
   indexLibrary();
   preload(added.flatMap(s => (s.files ?? []).map(file => ({ file, role: s.role, id: s.id }))));
-  await prepareLibrary(); // trigger + instant phrases for the new sounds
+  if (prep) await prepareLibrary(); // trigger + instant phrases for the new sounds
   return added;
 }
 
@@ -1205,18 +1219,26 @@ async function loadBatch2() {
   // the full plan is still being made in the background (cli.ts keeps `pending.waiting` until pending.json is written)
   for (let i = 0; i < 120 && !existsSync(join(dir, "pending.json")) && existsSync(join(dir, "pending.waiting")); i++) await new Promise(r => setTimeout(r, 1000));
   if (!existsSync(join(dir, "pending.json"))) return;
-  topUpBusy = true; // one writer of library.json at a time
+  // NOT holding the live-fetch lock any more: library.json writes take turns inside buildLibrary, so the live rounds
+  // ("fetch what was just said") keep working while batch 2 runs (they used to wait up to 2 minutes behind it)
   const t0 = Date.now();
   say(C.slow, "SCRAPE", "batch 2: fetching the rest of the library in the background…");
   try {
-    const fresh = await finishLibrary(dir);
-    const added = await mergeSounds(fresh, dir);
+    // each sound joins the talk the moment it's downloaded, not when the whole batch is done
+    const added: Sound[] = [];
+    let first = true;
+    await finishLibrary(dir, undefined, async rec => {
+      const a = await mergeSounds([rec], dir, false);
+      added.push(...a);
+      if (a.length && first) { first = false; say(C.slow, "SCRAPE", `batch 2: first new sound in after ${((Date.now() - t0) / 1000).toFixed(0)} s (${a[0].id}); more arriving…`); }
+    });
+    await prepareLibrary(); // phrases for any new sound that came without planner metadata
     const moods = added.filter(s => s.role === "music").map(s => s.mood);
     say(C.slow, "SCRAPE", `batch 2 in (${((Date.now() - t0) / 1000).toFixed(0)} s): +${added.length} sounds` +
       `${moods.length ? ` (music moods: ${moods.join(", ")})` : ""}: ${added.filter(s => s.role !== "music").map(s => s.id).join(", ")}`);
   } catch (e) {
     say(C.slow, "SCRAPE", `batch 2 failed (${(e as Error).message}); continuing with batch 1`);
-  } finally { topUpBusy = false; }
+  } finally { }
 }
 
 // LIVE SCRAPING FROM WHAT IS ACTUALLY SAID. Every meaningful sentence goes into `heardQueue`; whenever no fetch is running
@@ -1316,7 +1338,7 @@ async function main() {
   ]);
   console.log(`Sound plan for a ${clock.estMin} min talk${clock.speed !== 1 ? ` (test clock ${clock.speed}x)` : ""}:`);
   console.table(Object.fromEntries(ARCS.map(a => [a, { ...PLAN[a], sounds: budget(a) }])));
-  process.on("SIGINT", () => { printTimeline(); saveWeights(); fadeOutAndExit(); });
+  process.on("SIGINT", endTalk);
   console.log(existsSync(WEIGHTS_FILE) ? `Loaded learned weights from ${WEIGHTS_FILE}` : "Starting with default weights (they'll be saved to weights.json at /end)");
   // --web: sound goes to the browser mixer (crossfades, ducking, smooth levels); otherwise afplay plays from the terminal
   if (process.argv.includes("--web")) {
@@ -1407,9 +1429,7 @@ function command(line: string) {
     case "/plan":
       return console.table(Object.fromEntries(ARCS.map(a => [a, { ...PLAN[a], sounds: budget(a) }])));
     case "/end":
-      printTimeline();
-      saveWeights();
-      return fadeOutAndExit();
+      return endTalk();
     default:
       console.log(HELP);
   }

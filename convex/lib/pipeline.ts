@@ -22,6 +22,10 @@ export interface Providers {
   genMusic?: (prompt: string, lengthS: number) => Promise<GeneratedAudio>;
   tts?: (line: string, emotion?: string) => Promise<GeneratedAudio>;
   download: (url: string) => Promise<{ bytes: ArrayBuffer; contentType: string }>;
+  // CLAUDE CHOOSES: given the search results for a sound, return them best-first, or [] if none fits the talk
+  choose?: (slot: SfxSlot | MusicSlot, cands: Candidate[]) => Promise<Candidate[]>;
+  // nothing usable online (quota, throttled, offline): Claude may pick a fitting sound from earlier sessions, or none
+  reuse?: (slot: SfxSlot | MusicSlot) => Promise<Candidate[]>;
 }
 
 export interface Sink {
@@ -125,8 +129,18 @@ async function resolveSlot(slot: Slot, ctx: SlotCtx): Promise<ResolvedSound[]> {
   }
 
   // 1) search, 2) rank, 3) download the best that actually download
-  const candidates = await searchSlot(slot, ctx);
-  const ranked = rankCandidates(slot, candidates).filter((c) => !ctx.usedSourceIds.has(key(c)));
+  let candidates = await searchSlot(slot, ctx);
+  // nothing found online (daily quota used, throttled, offline): Claude decides whether an earlier session's sound fits
+  if (!candidates.length && ctx.providers.reuse) {
+    candidates = await ctx.providers.reuse(slot);
+    if (candidates.length) sayOnce(ctx, `reuse-${slot.id}`, `${slot.id}: no search results → Claude picked "${candidates[0].name}" from an earlier session`);
+  }
+  let ranked = rankCandidates(slot, candidates).filter((c) => !ctx.usedSourceIds.has(key(c)));
+  // the best few by tags go to Claude, who reads names/tags/lengths and picks the one that fits THIS talk (or none)
+  if (ctx.providers.choose && ranked.length > 1 && candidates[0]?.source !== "local") {
+    const picked = await ctx.providers.choose(slot, ranked.slice(0, 8));
+    if (picked.length) ranked = [...picked, ...ranked.filter((c) => !picked.includes(c))];
+  }
   const out: ResolvedSound[] = [];
   const tryGet = async (c: Candidate) => {
     ctx.usedSourceIds.add(key(c)); // claim before awaiting so parallel slots don't pick the same file
@@ -190,10 +204,12 @@ async function searchSlot(slot: SfxSlot | MusicSlot, ctx: SlotCtx): Promise<Cand
         : [{ minDurationS: slot.lengthS ? Math.max(0.1, slot.lengthS * 0.3) : 0.1, maxDurationS: slot.maxDurationS }, { minDurationS: 0.1, maxDurationS: slot.maxDurationS * 2 }];
 
   if (freesound && Date.now() >= health.fsBlockedUntil) {
-    // all queries of a window run at the same time: the same candidate pool as before, in ~1 search of wall time
-    for (const w of windows) {
+    // ONE search at a time, Claude's best phrase first; the next phrase / a wider duration only when results are thin.
+    // (All phrases × both windows at once cost up to 6 searches per sound and tripped the 60/min limit.)
+    outer: for (const w of windows) {
       let limited = false;
-      const results = await Promise.all(slot.queries.map(async (q) => {
+      for (const q0 of slot.queries) {
+      const results = await Promise.all([q0].map(async (q) => {
         try {
           const r = await freesound(q, w);
           health.fsBackoffMs = 60_000; // a good answer: the limit is over
@@ -211,7 +227,10 @@ async function searchSlot(slot: SfxSlot | MusicSlot, ctx: SlotCtx): Promise<Cand
         }
       }));
       for (const r of results) all.push(...r);
-      if (enough() || limited) break;
+      if (limited) break outer;
+      if (all.length >= 1) break outer; // the first phrase that finds anything wins (a page holds up to 15 to choose from);
+      // waiting for 3+ walked rare sounds through up to 6 searches one after another (slow, and quota)
+      }
     }
   }
   if (apify && all.length < 2 && !ctx.pastHalf()) {
@@ -253,9 +272,14 @@ async function generateFor(slot: SfxSlot | MusicSlot, ctx: SlotCtx): Promise<Res
       contentType: audio.contentType,
     };
   } catch (err) {
-    if (/quota_exceeded|credits remaining/i.test(String(err))) {
+    if (/quota_exceeded|credits remaining|out of credits/i.test(String(err))) {
       health.genOutOfCredits = true;
       sayOnce(ctx, "gen-credits", "ElevenLabs is out of credits: generation is switched off for this run (sounds can only come from Freesound)");
+    } else if (/missing_permissions|permission|unauthorized|HTTP 401|HTTP 402|invalid_api_key/i.test(String(err))) {
+      // a key without the sound_generation permission fails EVERY request: stop asking after the first one
+      health.genOutOfCredits = true;
+      sayOnce(ctx, "gen-perm", "ElevenLabs refused (key lacks the sound_generation permission, or is invalid): generation is off for this run. " +
+        "Fix: elevenlabs.io → API Keys → edit the key → enable Sound Effects / Sound Generation");
     } else ctx.log(`${slot.id}: generation failed ${String(err)}`);
     return null;
   }
@@ -295,6 +319,8 @@ async function resolveVoice(slot: VoiceSlot, ctx: SlotCtx): Promise<ResolvedSoun
 
 // ------------------------------------------------------------------ ranking
 
+const ONE_OFF = /^(horn|honk|siren|bell|alarm|announc|whistle|scream|shout|bark|gunshot|shot|explosion|crash|bang|ring|ringing|voice|voices|speech|talk|talking|dialog|beep|klaxon|traffic|street|car|cars)/;
+const MUSICAL = /^(music|musical|instrumental|ambient|pad|melody|melodic|soundtrack|score|cinematic|piano|strings|synth|orchestral|beat|loop|song|guitar|bass|chord|lofi|jazz|acoustic|ukulele|pizzicato|indie|pop)/;
 const tokenize = (s: string) => s.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length > 2);
 
 /** Simple, explainable ranking: tag/name overlap with the slot, popularity, rating, duration fit. */
@@ -318,8 +344,15 @@ export function rankCandidates(slot: SfxSlot | MusicSlot, cands: Candidate[]): C
         : c.durationS <= slot.maxDurationS ? 0.3 : -0.4 * (c.durationS / slot.maxDurationS - 1);
     }
     if (slot.kind === "music" && have.has("loop")) durationFit += 0.2;
+    // LOOPED music/backgrounds must be steady and musical: a horn, alarm or voice in the file comes back every loop,
+    // and a street recording is not music. Penalise one-off noises; reward files that are clearly music.
+    let bedFit = 0;
+    if (slot.kind === "music" || isBedSlot(slot)) {
+      if ([...have].some((w) => ONE_OFF.test(w))) bedFit -= 1.5;
+      if (slot.kind === "music") bedFit += [...have].some((w) => MUSICAL.test(w)) ? 0.4 : -0.8;
+    }
     const cc0 = c.license === "CC0" ? 0.05 : 0; // tie-breaker: no credit needed
-    return 2 * relevance + 0.5 * popularity + 0.3 * rating + durationFit + cc0;
+    return 2 * relevance + 0.5 * popularity + 0.3 * rating + durationFit + cc0 + bedFit;
   };
   return unique.map((c) => [score(c), c] as const).sort((a, b) => b[0] - a[0]).map(([, c]) => c);
 }
